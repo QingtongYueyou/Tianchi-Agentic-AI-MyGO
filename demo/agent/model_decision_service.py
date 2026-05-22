@@ -68,6 +68,22 @@ def _get_hour_of_day(sim_min: int) -> float:
     return min_in_day / 60.0
 
 
+def _get_horizon_minutes(status: dict) -> int:
+    """优先使用评测环境下发的仿真期限，兜底使用月度默认值。"""
+    try:
+        horizon = int(status.get("simulation_horizon_minutes", _MONTH_TOTAL_MINUTES))
+        return max(1, horizon)
+    except Exception:
+        return _MONTH_TOTAL_MINUTES
+
+
+def _iter_days_touched(start_min: int, end_min: int) -> range:
+    """返回 [start, end) 覆盖的自然日索引。"""
+    if end_min <= start_min:
+        return range(_get_day_index(start_min), _get_day_index(start_min) + 1)
+    return range(_get_day_index(start_min), _get_day_index(end_min - 1) + 1)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MonthlyConstraintPlanner - 月度偏好约束前置规划器 (Task #1)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,6 +211,24 @@ class StateTracker:
         if self._initialized:
             return
         self._initialized = True
+        self.refresh_from_history(api, driver_id)
+
+    def refresh_from_history(self, api: SimulationApiPort, driver_id: str) -> None:
+        """用评测会话内存中的真实动作记录重建状态，避免本地预估漂移。"""
+        planner = self.monthly_planner
+        self.total_income = 0.0
+        self.total_mileage_km = 0.0
+        self.total_deadhead_km = 0.0
+        self.total_orders = 0
+        self.orders_by_day = {}
+        self.wait_intervals = []
+        self.last_action_end_min = 0
+        self.idle_days = set()
+        self.active_days = set()
+        self.spatial_income = {}
+        self.total_tokens_used = 0
+        self.completed_idle_days = 0
+        self.monthly_planner = planner
         try:
             hist = api.query_decision_history(driver_id, -1)
             records = hist.get("records", [])
@@ -222,7 +256,6 @@ class StateTracker:
         action = rec.get("action", {})
         action_name = action.get("action", "")
         result = rec.get("result", {})
-        step_start = rec.get("step", 0)
         sim_end = 0
 
         if "simulation_progress_minutes" in result:
@@ -235,9 +268,13 @@ class StateTracker:
 
         if action_name == "take_order" and result.get("accepted"):
             self.total_orders += 1
-            day_idx = _get_day_index(sim_end)
+            step_elapsed = int(rec.get("step_elapsed_minutes", 0) or 0)
+            query_cost = int(rec.get("query_scan_cost_minutes", 0) or 0)
+            action_start = max(0, sim_end - step_elapsed + query_cost)
+            day_idx = _get_day_index(action_start)
             self.orders_by_day[day_idx] = self.orders_by_day.get(day_idx, 0) + 1
-            self.active_days.add(day_idx)
+            for d in _iter_days_touched(action_start, sim_end):
+                self.active_days.add(d)
             # 记录空间信息
             pos_after = rec.get("position_after", {})
             if pos_after:
@@ -255,8 +292,11 @@ class StateTracker:
                 self.wait_intervals.append((wait_start, sim_end))
 
         elif action_name == "reposition":
-            day_idx = _get_day_index(sim_end)
-            self.active_days.add(day_idx)
+            step_elapsed = int(rec.get("step_elapsed_minutes", 0) or 0)
+            query_cost = int(rec.get("query_scan_cost_minutes", 0) or 0)
+            action_start = max(0, sim_end - step_elapsed + query_cost)
+            for d in _iter_days_touched(action_start, sim_end):
+                self.active_days.add(d)
 
         if sim_end > self.last_action_end_min:
             self.last_action_end_min = sim_end
@@ -347,11 +387,14 @@ class PreferenceEngine:
 
     def get_constraints(self, driver_id: str, preferences: list[dict]) -> list[dict]:
         """获取结构化约束列表。首次调用 LLM 解析，后续直接返回缓存。"""
-        if driver_id in self._constraints_cache:
-            return self._constraints_cache[driver_id]
+        signature = json.dumps(preferences, ensure_ascii=False, sort_keys=True, default=str)
+        cache_key = f"{driver_id}:{signature}"
+        if cache_key in self._constraints_cache:
+            return self._constraints_cache[cache_key]
 
         constraints = self._parse_with_llm(preferences)
-        self._constraints_cache[driver_id] = constraints
+        constraints = self._merge_constraints(constraints, self._deterministic_parse(preferences))
+        self._constraints_cache[cache_key] = constraints
         return constraints
 
     def _parse_with_llm(self, preferences: list[dict]) -> list[dict]:
@@ -374,7 +417,7 @@ class PreferenceEngine:
             "output_format": {
                 "constraints": [
                     {
-                        "type": "约束类型(daily_rest/time_restriction/spatial_restrict/mileage_cap/day_off_requirement/time_window_location/cargo_category_ban/max_orders_per_day/max_haul_distance/max_deadhead_distance/custom)",
+                        "type": "约束类型(daily_rest/time_restriction/spatial_restrict/mileage_cap/day_off_requirement/time_window_location/daily_home_deadline/mandatory_cargo/scheduled_event/monthly_visit_requirement/cargo_category_ban/max_orders_per_day/max_haul_distance/max_deadhead_distance/custom)",
                         "description": "简要描述",
                         "params": "相关参数对象",
                         "penalty_amount": "单次违规罚款",
@@ -390,6 +433,10 @@ class PreferenceEngine:
                 "mileage_cap": {"max_deadhead_km": "最大空驶里程"},
                 "day_off_requirement": {"min_days_off": "月内最少休息天数"},
                 "time_window_location": {"target_lat": 0, "target_lng": 0, "deadline_sim_min": 0, "description": "..."},
+                "daily_home_deadline": {"home_lat": 0, "home_lng": 0, "deadline_hour": 23, "forbidden_start_hour": 23, "forbidden_end_hour": 8},
+                "mandatory_cargo": {"cargo_id": "货源编号", "pickup_lat": 0, "pickup_lng": 0, "activation_min": "上架仿真分钟"},
+                "scheduled_event": {"event_type": "family", "pickup_lat": 0, "pickup_lng": 0, "home_lat": 0, "home_lng": 0, "pickup_min": 0, "home_deadline_min": 0, "release_min": 0},
+                "monthly_visit_requirement": {"min_visit_days": 5, "target_lat": 0, "target_lng": 0, "radius_km": 1},
                 "cargo_category_ban": {"banned_categories": ["类别名"]},
                 "max_orders_per_day": {"max_orders": 3},
                 "max_haul_distance": {"max_km": 100},
@@ -415,6 +462,314 @@ class PreferenceEngine:
 
         # 兜底：返回简单约束
         return self._fallback_parse(preferences)
+
+    def _merge_constraints(self, parsed: list[dict], deterministic: list[dict]) -> list[dict]:
+        """LLM 结果和确定性解析互补；确定性解析负责关键罚分项兜底。"""
+        out: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for c in list(parsed or []) + list(deterministic or []):
+            if not isinstance(c, dict):
+                continue
+            ctype = str(c.get("type", "custom"))
+            params = c.get("params", {}) if isinstance(c.get("params", {}), dict) else {}
+            key_payload = json.dumps(params, ensure_ascii=False, sort_keys=True, default=str)
+            key = (ctype, key_payload)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(c)
+        return out
+
+    def _deterministic_parse(self, preferences: list[dict]) -> list[dict]:
+        """用业务文本里的稳定模式解析高价值约束，减少对模型解析的依赖。"""
+        constraints: list[dict] = []
+        for i, p in enumerate(preferences):
+            content = p.get("content", "") if isinstance(p, dict) else str(p)
+            penalty = p.get("penalty_amount", 0) if isinstance(p, dict) else 0
+            cap = p.get("penalty_cap") if isinstance(p, dict) else None
+            base = {
+                "penalty_amount": penalty,
+                "penalty_cap": cap,
+                "pref_index": i,
+                "description": content[:80],
+            }
+            if isinstance(p, dict):
+                base["visible_start_time"] = p.get("start_time")
+                base["visible_end_time"] = p.get("end_time")
+
+            mandatory = self._parse_mandatory_cargo(content, base)
+            if mandatory:
+                constraints.append(mandatory)
+
+            scheduled = self._parse_family_event(content, base)
+            if scheduled:
+                constraints.append(scheduled)
+
+            home = self._parse_daily_home_deadline(content, base)
+            if home:
+                constraints.append(home)
+
+            visit = self._parse_monthly_visit_requirement(content, base)
+            if visit:
+                constraints.append(visit)
+
+            banned = self._parse_banned_categories(content, base)
+            if banned:
+                constraints.append(banned)
+
+            rest = self._parse_daily_rest(content, base)
+            if rest:
+                constraints.append(rest)
+
+            days_off = self._parse_day_off(content, base)
+            if days_off:
+                constraints.append(days_off)
+
+            time_block = self._parse_time_restriction(content, base)
+            if time_block:
+                constraints.append(time_block)
+
+            deadhead_cap = self._parse_deadhead_cap(content, base)
+            if deadhead_cap:
+                constraints.append(deadhead_cap)
+
+            haul_cap = self._parse_haul_cap(content, base)
+            if haul_cap:
+                constraints.append(haul_cap)
+
+            max_orders = self._parse_max_orders_per_day(content, base)
+            if max_orders:
+                constraints.append(max_orders)
+
+            spatial = self._parse_spatial_restriction(content, base)
+            if spatial:
+                constraints.append(spatial)
+
+        return constraints
+
+    def _parse_mandatory_cargo(self, content: str, base: dict) -> dict | None:
+        if "熟货" not in content and "指定" not in content and "约定" not in content:
+            return None
+        match = re.search(r"(?:编号|cargo_id[=：:]?)\s*(\d+)", content, flags=re.I)
+        if not match:
+            return None
+        coords = self._extract_coords(content)
+        start_match = re.search(r"上架时间[：:]\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", content)
+        params: dict[str, Any] = {"cargo_id": match.group(1)}
+        if coords:
+            params["pickup_lat"], params["pickup_lng"] = coords[0]
+        if start_match:
+            try:
+                params["activation_min"] = _wall_to_sim_minutes(start_match.group(1))
+            except Exception:
+                pass
+        return {**base, "type": "mandatory_cargo", "params": params}
+
+    def _parse_family_event(self, content: str, base: dict) -> dict | None:
+        if "家事" not in content and "配偶" not in content:
+            return None
+        coords = self._extract_coords(content)
+        if len(coords) < 2:
+            return None
+        pickup_match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2}):(\d{2})", content)
+        deadline_match = re.search(r"须在(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2}):(\d{2})前", content)
+        release_matches = re.findall(r"(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2}):(\d{2})", content)
+        if not pickup_match:
+            return None
+
+        def to_wall(m: re.Match[str] | tuple[str, ...]) -> str:
+            groups = m.groups() if hasattr(m, "groups") else m
+            y, mo, d, h, mi = [int(x) for x in groups]
+            return f"{y:04d}-{mo:02d}-{d:02d} {h:02d}:{mi:02d}:00"
+
+        pickup_wall = to_wall(pickup_match)
+        deadline_wall = to_wall(deadline_match) if deadline_match else pickup_wall
+        release_wall = to_wall(release_matches[-1]) if release_matches else deadline_wall
+        params = {
+            "event_type": "family",
+            "pickup_lat": coords[0][0],
+            "pickup_lng": coords[0][1],
+            "home_lat": coords[1][0],
+            "home_lng": coords[1][1],
+            "pickup_min": _wall_to_sim_minutes(pickup_wall),
+            "home_deadline_min": _wall_to_sim_minutes(deadline_wall),
+            "release_min": _wall_to_sim_minutes(release_wall),
+            "pickup_wait_minutes": 10,
+        }
+        return {**base, "type": "scheduled_event", "params": params}
+
+    def _parse_daily_home_deadline(self, content: str, base: dict) -> dict | None:
+        if "家" not in content or "点前" not in content:
+            return None
+        coords = self._extract_coords(content)
+        if not coords:
+            return None
+        deadline = re.search(r"每天\s*(\d{1,2})点前", content)
+        night = re.search(r"(\d{1,2})点至次日\s*(\d{1,2})点", content)
+        params = {
+            "home_lat": coords[0][0],
+            "home_lng": coords[0][1],
+            "deadline_hour": int(deadline.group(1)) if deadline else 23,
+            "radius_km": 1.0,
+        }
+        if night:
+            params["forbidden_start_hour"] = int(night.group(1))
+            params["forbidden_end_hour"] = int(night.group(2))
+        return {**base, "type": "daily_home_deadline", "params": params}
+
+    def _parse_monthly_visit_requirement(self, content: str, base: dict) -> dict | None:
+        if "不同的自然日到过" not in content and "至少" not in content:
+            return None
+        coords = self._extract_coords(content)
+        days = re.search(r"至少\s*(\d+)\s*个?不同的自然日", content)
+        if not coords or not days:
+            return None
+        return {
+            **base,
+            "type": "monthly_visit_requirement",
+            "params": {
+                "min_visit_days": int(days.group(1)),
+                "target_lat": coords[0][0],
+                "target_lng": coords[0][1],
+                "radius_km": 1.0,
+            },
+        }
+
+    def _parse_banned_categories(self, content: str, base: dict) -> dict | None:
+        if "不接" not in content and "不拉" not in content:
+            return None
+        cats = re.findall(r"「([^」]+)」", content)
+        if not cats:
+            return None
+        return {**base, "type": "cargo_category_ban", "params": {"banned_categories": cats}}
+
+    def _parse_daily_rest(self, content: str, base: dict) -> dict | None:
+        if "休息" not in content and "歇" not in content and "停车" not in content:
+            return None
+        match = re.search(r"(?:满|至少|不少于)?\s*(\d+(?:\.\d+)?)\s*小时", content)
+        if not match:
+            return None
+        minutes = int(float(match.group(1)) * 60)
+        return {**base, "type": "daily_rest", "params": {"min_continuous_minutes": minutes}}
+
+    def _parse_day_off(self, content: str, base: dict) -> dict | None:
+        if "自然月" not in content and "每月" not in content and "月内" not in content:
+            return None
+        if "天" not in content or ("不接单" not in content and "歇" not in content and "放空" not in content):
+            return None
+        match = re.search(r"至少(?:要有)?\s*(\d+)\s*个?(?:整天|天|日)", content)
+        if not match:
+            match = re.search(r"(\d+)\s*个?(?:整天|天|日).*?(?:不接单|歇|放空)", content)
+        if match:
+            days = int(match.group(1))
+        else:
+            cn_match = re.search(r"([一二两三四五六七八九十]+)\s*个?(?:整天|天|日).*?(?:不接单|歇|放空)", content)
+            days = self._chinese_number(cn_match.group(1)) if cn_match else 0
+        if days <= 0:
+            return None
+        return {**base, "type": "day_off_requirement", "params": {"min_days_off": days}}
+
+    def _parse_time_restriction(self, content: str, base: dict) -> dict | None:
+        if "不接单" not in content and "不空" not in content:
+            return None
+        match = re.search(r"(\d{1,2})[点:：](?:\d{2})?\s*(?:至|-|到)\s*(?:次日|翌日)?\s*(\d{1,2})[点:：]?", content)
+        if not match:
+            return None
+        return {
+            **base,
+            "type": "time_restriction",
+            "params": {
+                "start_hour": int(match.group(1)),
+                "end_hour": int(match.group(2)),
+                "forbidden_actions": ["take_order", "reposition"],
+            },
+        }
+
+    def _parse_deadhead_cap(self, content: str, base: dict) -> dict | None:
+        if "空驶" not in content and "赴装货点" not in content:
+            return None
+        match = re.search(r"(?:不超过|≤|小于等于)\s*(\d+(?:\.\d+)?)\s*公里", content)
+        if not match:
+            return None
+        max_km = float(match.group(1))
+        ctype = "mileage_cap" if "月" in content and "空驶" in content else "max_deadhead_distance"
+        key = "max_deadhead_km"
+        return {**base, "type": ctype, "params": {key: max_km}}
+
+    def _parse_haul_cap(self, content: str, base: dict) -> dict | None:
+        if "装货点至卸货点" not in content and "装卸距离" not in content:
+            return None
+        match = re.search(r"(?:不超过|≤|小于等于)\s*(\d+(?:\.\d+)?)\s*公里", content)
+        if not match:
+            return None
+        return {**base, "type": "max_haul_distance", "params": {"max_km": float(match.group(1))}}
+
+    def _parse_spatial_restriction(self, content: str, base: dict) -> dict | None:
+        if "深圳" in content and "范围" in content:
+            lat_match = re.search(r"北纬\s*(\d+(?:\.\d+)?)\s*至\s*(\d+(?:\.\d+)?)", content)
+            lng_match = re.search(r"东经\s*(\d+(?:\.\d+)?)\s*至\s*(\d+(?:\.\d+)?)", content)
+            if lat_match and lng_match:
+                return {
+                    **base,
+                    "type": "spatial_restrict",
+                    "params": {
+                        "type": "bounding_box",
+                        "bounding_box": {
+                            "lat_min": float(lat_match.group(1)),
+                            "lat_max": float(lat_match.group(2)),
+                            "lng_min": float(lng_match.group(1)),
+                            "lng_max": float(lng_match.group(2)),
+                        },
+                    },
+                }
+        if "不得进入" in content and "半径" in content:
+            coords = self._extract_coords(content)
+            radius = re.search(r"半径\s*(\d+(?:\.\d+)?)\s*公里", content)
+            if coords and radius:
+                return {
+                    **base,
+                    "type": "spatial_restrict",
+                    "params": {
+                        "type": "forbidden_circle",
+                        "center_lat": coords[0][0],
+                        "center_lng": coords[0][1],
+                        "radius_km": float(radius.group(1)),
+                    },
+                }
+        return None
+
+    def _parse_max_orders_per_day(self, content: str, base: dict) -> dict | None:
+        if "同一天" not in content and "每天" not in content:
+            return None
+        if "接单" not in content or ("不得超过" not in content and "不超过" not in content and "≤" not in content):
+            return None
+        match = re.search(r"(?:不得超过|不超过|≤)\s*(\d+)\s*单", content)
+        if not match:
+            return None
+        return {**base, "type": "max_orders_per_day", "params": {"max_orders": int(match.group(1))}}
+
+    @staticmethod
+    def _extract_coords(text: str) -> list[tuple[float, float]]:
+        coords: list[tuple[float, float]] = []
+        for a, b in re.findall(r"[（(]\s*(-?\d+(?:\.\d+)?)\s*[，,]\s*(-?\d+(?:\.\d+)?)\s*[）)]", text):
+            try:
+                coords.append((float(a), float(b)))
+            except Exception:
+                continue
+        return coords
+
+    @staticmethod
+    def _chinese_number(text: str) -> int:
+        table = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+                 "六": 6, "七": 7, "八": 8, "九": 9}
+        if text == "十":
+            return 10
+        if text.startswith("十"):
+            return 10 + table.get(text[1:], 0)
+        if "十" in text:
+            left, right = text.split("十", 1)
+            return table.get(left, 0) * 10 + table.get(right, 0)
+        return table.get(text, 0)
 
     def _fallback_parse(self, preferences: list[dict]) -> list[dict]:
         """无 LLM 时的简单规则匹配兜底。"""
@@ -866,42 +1221,48 @@ class RuleLayer:
     """不调用 LLM 的快速路径决策。"""
 
     def evaluate(self, status: dict, state: StateTracker,
-                 constraints: list[dict], items: list[dict]) -> dict | None:
+                 constraints: list[dict], items: list[dict] | None) -> dict | None:
         """返回决策 dict 或 None（需继续后续层）。"""
         current_min = int(status.get("simulation_progress_minutes", 0))
         hour = _get_hour_of_day(current_min)
-        remaining = _MONTH_TOTAL_MINUTES - current_min
+        horizon = _get_horizon_minutes(status)
+        remaining = horizon - current_min
 
-        # 0. 月度规划空闲日检查（Task #1）
-        idle_result = self._check_planned_idle_day(current_min, state)
+        # 0. 最高优先级：临时约定、家事、每日回家等强约束。
+        urgent_result = self._check_urgent_constraints(status, current_min, constraints, items)
+        if urgent_result is not None:
+            return urgent_result
+
+        # 1. 月度规划空闲日检查（Task #1）
+        idle_result = self._check_planned_idle_day(current_min, state, horizon)
         if idle_result is not None:
             return idle_result
 
-        # 1. 月末收官：剩余不足 60 分钟无法完成任何订单
+        # 2. 月末收官：剩余不足 60 分钟无法完成任何订单
         if remaining <= 0:
-            return {"action": "wait", "params": {"duration_minutes": 0}}
+            return self._wait(1)
         if remaining <= 60:
             wait_min = max(1, remaining)
             return self._wait(wait_min)
 
-        # 2. 禁行时段检查
-        block_result = self._check_time_block(hour, current_min, constraints)
+        # 3. 禁行时段检查
+        block_result = self._check_time_block(hour, current_min, constraints, horizon)
         if block_result is not None:
             return block_result
 
-        # 3. 强制休息检查
-        rest_result = self._check_forced_rest(current_min, state, constraints)
+        # 4. 强制休息检查
+        rest_result = self._check_forced_rest(current_min, state, constraints, horizon)
         if rest_result is not None:
             return rest_result
 
-        # 4. 窗口约束触发（必须前往指定位置）
+        # 5. 窗口约束触发（必须前往指定位置）
         location_result = self._check_time_window_location(
             status, current_min, constraints)
         if location_result is not None:
             return location_result
 
-        # 5. 深夜无货（22:00-06:00 且无有效货源）
-        if (hour >= 22.0 or hour < 6.0) and not items:
+        # 6. 深夜无货（22:00-06:00 且确认无有效货源）
+        if items is not None and (hour >= 22.0 or hour < 6.0) and not items:
             # 等到早上6点
             if hour >= 22.0:
                 wait_until = ((_get_day_index(current_min) + 1) * 1440) + 360  # 次日6:00
@@ -912,8 +1273,154 @@ class RuleLayer:
 
         return None
 
+    def _check_urgent_constraints(self, status: dict, current_min: int,
+                                  constraints: list[dict], items: list[dict] | None) -> dict | None:
+        for c in constraints:
+            ctype = c.get("type")
+            if ctype == "scheduled_event":
+                decision = self._check_scheduled_event(status, current_min, c)
+                if decision:
+                    return decision
+            if ctype == "daily_home_deadline":
+                decision = self._check_daily_home_deadline(status, current_min, c)
+                if decision:
+                    return decision
+            if ctype == "monthly_visit_requirement":
+                decision = self._check_monthly_visit_requirement(status, current_min, c)
+                if decision:
+                    return decision
+            if ctype == "mandatory_cargo":
+                decision = self._check_mandatory_cargo(status, current_min, c, items)
+                if decision:
+                    return decision
+        return None
+
+    def _check_mandatory_cargo(self, status: dict, current_min: int,
+                               constraint: dict, items: list[dict] | None) -> dict | None:
+        params = constraint.get("params", {})
+        cargo_id = str(params.get("cargo_id", "")).strip()
+        if not cargo_id:
+            return None
+        activation = int(params.get("activation_min", current_min))
+        pickup_lat = params.get("pickup_lat")
+        pickup_lng = params.get("pickup_lng")
+        lat = float(status.get("current_lat", 0))
+        lng = float(status.get("current_lng", 0))
+
+        if pickup_lat is not None and pickup_lng is not None and current_min < activation:
+            dist = haversine(lat, lng, float(pickup_lat), float(pickup_lng))
+            travel_min = _distance_to_minutes(dist)
+            if current_min + travel_min + 30 >= activation and dist > 1.0:
+                return self._reposition(float(pickup_lat), float(pickup_lng))
+            if activation - current_min <= 120:
+                return self._wait(min(60, activation - current_min))
+            return None
+
+        if current_min >= activation:
+            if items is None:
+                return {"action": "take_order", "params": {"cargo_id": cargo_id}}
+            visible_ids = {str((it.get("cargo") or {}).get("cargo_id", "")) for it in items}
+            if cargo_id in visible_ids:
+                return {"action": "take_order", "params": {"cargo_id": cargo_id}}
+        return None
+
+    def _check_scheduled_event(self, status: dict, current_min: int, constraint: dict) -> dict | None:
+        params = constraint.get("params", {})
+        pickup_min = int(params.get("pickup_min", 10**9))
+        deadline = int(params.get("home_deadline_min", pickup_min))
+        release = int(params.get("release_min", deadline))
+        pickup_lat = params.get("pickup_lat")
+        pickup_lng = params.get("pickup_lng")
+        home_lat = params.get("home_lat")
+        home_lng = params.get("home_lng")
+        if None in (pickup_lat, pickup_lng, home_lat, home_lng):
+            return None
+        lat = float(status.get("current_lat", 0))
+        lng = float(status.get("current_lng", 0))
+        prep_start = pickup_min - 24 * 60
+
+        if prep_start <= current_min < pickup_min:
+            dist = haversine(lat, lng, float(pickup_lat), float(pickup_lng))
+            if dist > 1.0:
+                return self._reposition(float(pickup_lat), float(pickup_lng))
+            return self._wait(min(60, pickup_min - current_min))
+
+        if pickup_min <= current_min < deadline:
+            pickup_dist = haversine(lat, lng, float(pickup_lat), float(pickup_lng))
+            if pickup_dist > 1.0 and current_min < pickup_min + 120:
+                return self._reposition(float(pickup_lat), float(pickup_lng))
+            if pickup_dist <= 1.0 and current_min < pickup_min + int(params.get("pickup_wait_minutes", 10)):
+                return self._wait(int(params.get("pickup_wait_minutes", 10)))
+            home_dist = haversine(lat, lng, float(home_lat), float(home_lng))
+            if home_dist > 1.0:
+                return self._reposition(float(home_lat), float(home_lng))
+            return self._wait(min(60, max(1, deadline - current_min)))
+
+        if deadline <= current_min < release:
+            home_dist = haversine(lat, lng, float(home_lat), float(home_lng))
+            if home_dist > 1.0:
+                return self._reposition(float(home_lat), float(home_lng))
+            return self._wait(min(480, max(1, release - current_min)))
+        return None
+
+    def _check_daily_home_deadline(self, status: dict, current_min: int, constraint: dict) -> dict | None:
+        params = constraint.get("params", {})
+        home_lat = params.get("home_lat")
+        home_lng = params.get("home_lng")
+        if home_lat is None or home_lng is None:
+            return None
+        lat = float(status.get("current_lat", 0))
+        lng = float(status.get("current_lng", 0))
+        hour = _get_hour_of_day(current_min)
+        day_start = _get_day_index(current_min) * 1440
+        deadline_hour = float(params.get("deadline_hour", 23))
+        deadline_min = day_start + int(deadline_hour * 60)
+        dist = haversine(lat, lng, float(home_lat), float(home_lng))
+        radius = float(params.get("radius_km", 1.0))
+        start_h = params.get("forbidden_start_hour")
+        end_h = params.get("forbidden_end_hour")
+
+        if start_h is not None and end_h is not None and PreferenceEngine._in_time_range(hour, float(start_h), float(end_h)):
+            if dist > radius:
+                return self._reposition(float(home_lat), float(home_lng))
+            wait_min = self._minutes_until_hour(hour, float(end_h))
+            return self._wait(wait_min)
+
+        travel_min = _distance_to_minutes(dist)
+        if dist > radius and current_min + travel_min + 30 >= deadline_min and current_min < deadline_min:
+            return self._reposition(float(home_lat), float(home_lng))
+        return None
+
+    def _check_monthly_visit_requirement(self, status: dict, current_min: int, constraint: dict) -> dict | None:
+        params = constraint.get("params", {})
+        target_lat = params.get("target_lat")
+        target_lng = params.get("target_lng")
+        if target_lat is None or target_lng is None:
+            return None
+        horizon = _get_horizon_minutes(status)
+        total_days = max(1, math.ceil(horizon / 1440))
+        current_day = _get_day_index(current_min) + 1
+        required = int(params.get("min_visit_days", 0))
+        if required <= 0:
+            return None
+        # 均匀安排访问日；靠近月末时兜底去目标点。
+        planned_days = {max(1, min(total_days, round((i + 1) * total_days / required))) for i in range(required)}
+        if current_day not in planned_days and total_days - current_day >= required:
+            return None
+        lat = float(status.get("current_lat", 0))
+        lng = float(status.get("current_lng", 0))
+        dist = haversine(lat, lng, float(target_lat), float(target_lng))
+        if dist > float(params.get("radius_km", 1.0)):
+            return self._reposition(float(target_lat), float(target_lng))
+        return None
+
+    @staticmethod
+    def _minutes_until_hour(current_hour: float, target_hour: float) -> int:
+        if current_hour <= target_hour:
+            return max(1, int((target_hour - current_hour) * 60))
+        return max(1, int((24 - current_hour + target_hour) * 60))
     def _check_time_block(self, hour: float, current_min: int,
-                          constraints: list[dict]) -> dict | None:
+                          constraints: list[dict], horizon: int) -> dict | None:
         """检查是否在禁行时段。"""
         for c in constraints:
             if c.get("type") != "time_restriction":
@@ -933,12 +1440,12 @@ class RuleLayer:
                         wait_min = int((end_h - hour) * 60)
                 else:
                     wait_min = int((end_h - hour) * 60)
-                wait_min = max(1, min(wait_min + 1, _MONTH_TOTAL_MINUTES - current_min))
+                wait_min = max(1, min(wait_min + 1, horizon - current_min))
                 return self._wait(wait_min)
         return None
 
     def _check_forced_rest(self, current_min: int, state: StateTracker,
-                           constraints: list[dict]) -> dict | None:
+                           constraints: list[dict], horizon: int) -> dict | None:
         """检查今天是否满足了最低连续休息要求。"""
         for c in constraints:
             if c.get("type") != "daily_rest":
@@ -953,7 +1460,7 @@ class RuleLayer:
             remaining_today = 1440 - (current_min % 1440)
             if current_rest < required_min and remaining_today <= required_min + 60:
                 need = required_min - current_rest
-                remaining_total = _MONTH_TOTAL_MINUTES - current_min
+                remaining_total = horizon - current_min
                 wait_min = max(1, min(need, remaining_today, remaining_total))
                 return self._wait(wait_min)
         return None
@@ -981,7 +1488,7 @@ class RuleLayer:
                 return self._reposition(target_lat, target_lng)
         return None
 
-    def _check_planned_idle_day(self, current_min: int, state: StateTracker) -> dict | None:
+    def _check_planned_idle_day(self, current_min: int, state: StateTracker, horizon: int) -> dict | None:
         """检查今日是否为规划的空闲日或是否需要触发补救模式（Task #1）。"""
         planner = state.monthly_planner
         if planner is None or planner.required_idle_days <= 0:
@@ -989,7 +1496,7 @@ class RuleLayer:
 
         # 当前天数（1-based）
         current_day = _get_day_index(current_min) + 1
-        remaining = _MONTH_TOTAL_MINUTES - current_min
+        remaining = horizon - current_min
 
         # 如果今天是规划的空闲日，直接等待到次日0点
         if planner.is_today_idle_day(current_day):
@@ -1104,13 +1611,14 @@ class HeuristicLayer:
                        constraints: list[dict], top_n: int = 5) -> list[dict]:
         """评分并返回 Top N 候选（Task #2 优化评分公式）。"""
         current_min = int(status.get("simulation_progress_minutes", 0))
-        lat = float(status.get("current_lat", 0))
-        lng = float(status.get("current_lng", 0))
-        remaining = _MONTH_TOTAL_MINUTES - current_min
+        horizon = _get_horizon_minutes(status)
+        remaining = horizon - current_min
 
         # 计算月度进度比（Task #2）
-        month_progress_ratio = current_min / _MONTH_TOTAL_MINUTES
+        month_progress_ratio = current_min / max(1, horizon)
         time_phase_multiplier = self._get_time_phase_multiplier(month_progress_ratio)
+        banned_categories = self._get_banned_categories(constraints)
+        monthly_deadhead_cap = self._get_monthly_deadhead_cap(constraints)
 
         scored = []
 
@@ -1129,21 +1637,29 @@ class HeuristicLayer:
             load_time = cargo.get("load_time")
             cargo_name = cargo.get("cargo_name", "")
 
+            # 过滤: 禁接/尽量不拉的品类先剔除，避免用收益抵消硬偏好罚款。
+            if any(b in cargo_name for b in banned_categories):
+                continue
+
             # 过滤: 装货时间窗已过期
+            deadhead_min = _distance_to_minutes(distance_km) if distance_km > 1e-6 else 0
+            wait_for_load_min = 0
             if load_time and isinstance(load_time, list) and len(load_time) == 2:
                 try:
                     window_end_min = _wall_to_sim_minutes(str(load_time[1]).strip())
-                    deadhead_min = _distance_to_minutes(distance_km)
                     arrival_min = current_min + deadhead_min
                     if arrival_min > window_end_min:
                         continue
+                    window_start_min = _wall_to_sim_minutes(str(load_time[0]).strip())
+                    wait_for_load_min = max(0, window_start_min - arrival_min)
                 except Exception:
                     pass
 
             # 过滤: 月内无法完成
-            deadhead_min = _distance_to_minutes(distance_km)
-            total_time = deadhead_min + cost_time
+            total_time = deadhead_min + wait_for_load_min + cost_time
             if total_time > remaining:
+                continue
+            if self._violates_time_restriction(current_min, current_min + total_time, constraints):
                 continue
 
             # 计算干线距离
@@ -1176,6 +1692,12 @@ class HeuristicLayer:
                     if distance_km > max_km:
                         penalty_score += p_amount
 
+                elif ctype == "mileage_cap":
+                    max_km = float(params.get("max_deadhead_km", 9999))
+                    if state.total_deadhead_km + distance_km > max_km:
+                        over = state.total_deadhead_km + distance_km - max_km
+                        penalty_score += max(p_amount, over * 10.0)
+
                 elif ctype == "max_haul_distance":
                     max_km = float(params.get("max_km", 9999))
                     if haul_km > max_km:
@@ -1205,11 +1727,18 @@ class HeuristicLayer:
 
             # 稀缺性因子（Task #2）
             scarcity_factor = self._get_scarcity_factor(item, state)
+            deadhead_ratio = distance_km / max(1.0, distance_km + haul_km)
+            deadhead_penalty = deadhead_ratio * 100.0
+            if monthly_deadhead_cap is not None:
+                remaining_quota = monthly_deadhead_cap - state.total_deadhead_km
+                if distance_km > remaining_quota:
+                    deadhead_penalty += max(0.0, distance_km - remaining_quota) * 10.0
 
             # 新综合评分公式（Task #2）
             score = (
                 time_efficiency * 60 * time_phase_multiplier
                 - penalty_score * 2.0 * (1 + preference_impact)
+                - deadhead_penalty
                 + cluster_value
                 + net_profit * 0.15
                 + scarcity_factor
@@ -1236,6 +1765,54 @@ class HeuristicLayer:
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:top_n]
 
+    @staticmethod
+    def _get_banned_categories(constraints: list[dict]) -> set[str]:
+        banned: set[str] = set()
+        for c in constraints:
+            if c.get("type") == "cargo_category_ban":
+                params = c.get("params", {})
+                for item in params.get("banned_categories", []):
+                    banned.add(str(item))
+        return banned
+
+    @staticmethod
+    def _get_monthly_deadhead_cap(constraints: list[dict]) -> float | None:
+        caps: list[float] = []
+        for c in constraints:
+            if c.get("type") == "mileage_cap":
+                try:
+                    caps.append(float(c.get("params", {}).get("max_deadhead_km")))
+                except Exception:
+                    continue
+        return min(caps) if caps else None
+
+    @staticmethod
+    def _violates_time_restriction(start_min: int, end_min: int, constraints: list[dict]) -> bool:
+        for c in constraints:
+            if c.get("type") != "time_restriction":
+                continue
+            params = c.get("params", {})
+            if "take_order" not in params.get("forbidden_actions", ["take_order", "reposition"]):
+                continue
+            start_h = params.get("start_hour")
+            end_h = params.get("end_hour")
+            if start_h is None or end_h is None:
+                continue
+            for day in _iter_days_touched(start_min, end_min):
+                forbidden_start = day * 1440 + int(float(start_h) * 60)
+                if float(start_h) <= float(end_h):
+                    forbidden_end = day * 1440 + int(float(end_h) * 60)
+                    windows = [(forbidden_start, forbidden_end)]
+                else:
+                    windows = [
+                        (forbidden_start, (day + 1) * 1440),
+                        (day * 1440, day * 1440 + int(float(end_h) * 60)),
+                    ]
+                for a, b in windows:
+                    if start_min < b and end_min > a:
+                        return True
+        return False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LLMLayer - LLM 决策层
@@ -1254,7 +1831,7 @@ class LLMLayer:
         """让 LLM 从候选中选择最优决策。"""
         current_min = int(status.get("simulation_progress_minutes", 0))
         hour = _get_hour_of_day(current_min)
-        remaining = _MONTH_TOTAL_MINUTES - current_min
+        remaining = _get_horizon_minutes(status) - current_min
         day_idx = _get_day_index(current_min) + 1
 
         # 构建精简 prompt
@@ -1622,18 +2199,17 @@ class MultiDriverCoordinationLayer:
         """记录司机决策（用于避免竞争）"""
         if action == "take_order" and cargo_id:
             self.cargo_claim_history[cargo_id] = driver_id
+            if driver_id in self.driver_profiles:
+                self.driver_profiles[driver_id]["total_orders"] += 1
         self.active_decisions[driver_id] = {
             "cargo_id": cargo_id, "action": action
         }
-        # 更新统计
-        if driver_id in self.driver_profiles:
-            self.driver_profiles[driver_id]["total_orders"] += 1
 
     def filter_competitive_cargo(self, driver_id: str, candidates: list) -> list:
         """过滤已被其他司机接的货源（避免竞争）"""
         filtered = []
         for item in candidates:
-            cargo_id = item.get("cargo", {}).get("id", "")
+            cargo_id = str(item.get("cargo", {}).get("cargo_id", ""))
             if cargo_id not in self.cargo_claim_history:
                 filtered.append(item)
         return filtered if filtered else candidates  # 保底
@@ -1726,10 +2302,11 @@ class ModelDecisionService:
         lat = float(status["current_lat"])
         lng = float(status["current_lng"])
         current_min = int(status.get("simulation_progress_minutes", 0))
+        horizon = _get_horizon_minutes(status)
 
         # 2. 初始化/更新 StateTracker
         state = self._get_state(driver_id)
-        state.initialize_from_history(self._api, driver_id)
+        state.refresh_from_history(self._api, driver_id)
 
         # 2.5 从历史填充 pattern_analyzer（Task #4，仅一次）
         if driver_id not in self._pattern_filled:
@@ -1753,7 +2330,7 @@ class ModelDecisionService:
                     if days_off > 0:
                         pref_text += f" 至少{days_off}天不接单"
                         break
-            total_days = _MONTH_TOTAL_MINUTES // 1440
+            total_days = max(1, math.ceil(horizon / 1440))
             state.monthly_planner = MonthlyConstraintPlanner(pref_text, total_days)
             _logger.info("初始化月度规划器: required_idle=%d, planned=%s",
                          state.monthly_planner.required_idle_days,
@@ -1770,7 +2347,7 @@ class ModelDecisionService:
             self._registered_drivers.add(driver_id)
 
         # 4. 规则层快速路径（先不查货源的规则）
-        rule_decision = self._rule_layer.evaluate(status, state, constraints, [])
+        rule_decision = self._rule_layer.evaluate(status, state, constraints, None)
         if rule_decision is not None:
             self._logger.info("规则层决策 driver=%s action=%s", driver_id, rule_decision.get("action"))
             self._update_state_after_decision(state, rule_decision, current_min)
@@ -1890,7 +2467,7 @@ class ModelDecisionService:
             _decision_complexity = "high"  # 候选接近，需LLM精细决策
 
         # 估算剩余决策步数
-        remaining_min = _MONTH_TOTAL_MINUTES - current_min
+        remaining_min = horizon - current_min
         _remaining_steps = max(1, remaining_min // 60)  # 粗估每60分钟一步
 
         # 同步 StateTracker 的 token 用量到 token_optimizer

@@ -38,6 +38,7 @@ class EmbeddedDecisionEnvironment:
         session_actions_by_driver: dict[str, list[dict[str, Any]]] | None = None,
         nearest_cargo_limit: int = 100,
         cargo_view_batch_size: int = 10,
+        simulation_duration_days: int = 30,
     ) -> None:
         self._repo = repo
         self._manager = manager
@@ -45,11 +46,14 @@ class EmbeddedDecisionEnvironment:
         self._session_actions_by_driver = session_actions_by_driver
         self._nearest_cargo_limit = nearest_cargo_limit
         self._cargo_view_batch_size = cargo_view_batch_size
+        self._simulation_horizon_minutes = int(simulation_duration_days) * 24 * 60
         self._logger = logging.getLogger("bench.embedded_agent.environment")
         self._last_model_usage = self._empty_usage()
 
     def get_driver_status(self, driver_id: str) -> dict[str, Any]:
-        return self._manager.get_driver_status(driver_id)
+        status = self._manager.get_driver_status(driver_id)
+        status["simulation_horizon_minutes"] = self._simulation_horizon_minutes
+        return status
 
     def query_cargo(self, driver_id: str, latitude: float, longitude: float) -> dict[str, Any]:
         sim_min_before = self._manager.get_simulation_progress_minutes()
@@ -197,12 +201,14 @@ def build_embedded_agent_decision_engine(
     model_gateway: ModelGatewayClient,
     *,
     session_actions_by_driver: dict[str, list[dict[str, Any]]] | None = None,
+    simulation_duration_days: int = 30,
 ) -> EmbeddedAgentDecisionEngine:
     environment = EmbeddedDecisionEnvironment(
         repo=repo,
         manager=manager,
         model_gateway=model_gateway,
         session_actions_by_driver=session_actions_by_driver,
+        simulation_duration_days=simulation_duration_days,
     )
     environment_port: SimulationApiPort = environment
     decision_service = ModelDecisionService(environment_port)

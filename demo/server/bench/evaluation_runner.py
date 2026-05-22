@@ -53,6 +53,7 @@ class EvaluationRunner:
                 manager=manager,
                 model_gateway=model_gateway,
                 session_actions_by_driver=session_actions_by_driver,
+                simulation_duration_days=settings.simulation_duration_days,
             )
             orchestrator = SimulationOrchestrator(
                 cargo_repository=repo,
