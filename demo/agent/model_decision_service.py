@@ -283,6 +283,13 @@ class StateTracker:
             self.total_deadhead_km += float(deadhead)
             haul = result.get("haul_distance_km", 0)
             self.total_mileage_km += float(deadhead) + float(haul)
+            for key in ("price", "income", "revenue", "gross_income"):
+                if key in result:
+                    try:
+                        self.total_income += float(result[key])
+                        break
+                    except Exception:
+                        continue
 
         elif action_name == "wait":
             params = action.get("params", {})
@@ -798,7 +805,7 @@ class PreferenceEngine:
                 km = self._extract_number(content, "公里")
                 c["type"] = "mileage_cap" if "月" in content else "max_deadhead_distance"
                 c["params"] = {"max_deadhead_km": km or 100}
-            elif "整天" in content or "休息日" in content or "不接单" in content and "天" in content:
+            elif ("整天" in content or "休息日" in content or "不接单" in content) and "天" in content:
                 days = self._extract_number(content, "天") or self._extract_number(content, "个")
                 c["type"] = "day_off_requirement"
                 c["params"] = {"min_days_off": int(days) if days else 2}
@@ -1384,7 +1391,8 @@ class RuleLayer:
             if dist > radius:
                 return self._reposition(float(home_lat), float(home_lng))
             wait_min = self._minutes_until_hour(hour, float(end_h))
-            return self._wait(wait_min)
+            horizon = _get_horizon_minutes(status)
+            return self._wait(min(wait_min, max(1, horizon - current_min)))
 
         travel_min = _distance_to_minutes(dist)
         if dist > radius and current_min + travel_min + 30 >= deadline_min and current_min < deadline_min:
@@ -1419,6 +1427,7 @@ class RuleLayer:
         if current_hour <= target_hour:
             return max(1, int((target_hour - current_hour) * 60))
         return max(1, int((24 - current_hour + target_hour) * 60))
+
     def _check_time_block(self, hour: float, current_min: int,
                           constraints: list[dict], horizon: int) -> dict | None:
         """检查是否在禁行时段。"""
@@ -1497,6 +1506,10 @@ class RuleLayer:
         # 当前天数（1-based）
         current_day = _get_day_index(current_min) + 1
         remaining = horizon - current_min
+        completed_idle = state.get_full_idle_days_count(current_min)
+        remaining_required = max(0, planner.required_idle_days - completed_idle)
+        if remaining_required <= 0:
+            return None
 
         # 如果今天是规划的空闲日，直接等待到次日0点
         if planner.is_today_idle_day(current_day):
@@ -1507,13 +1520,16 @@ class RuleLayer:
             _logger.info("规划空闲日: day=%d, wait=%d min", current_day, wait_min)
             return self._wait(wait_min)
 
-        # 如果触发补救模式（剩余天数不够完成空闲日需求），强制等待
-        if planner.should_trigger_rescue_mode(state.completed_idle_days, current_day):
+        # 只在规划空闲日不足以覆盖剩余需求时，用当前非活跃日补救，避免月末无差别停摆。
+        future_planned = [d for d in planner.get_planned_idle_days() if d >= current_day]
+        current_day_idx = _get_day_index(current_min)
+        can_rescue_today = current_day_idx not in state.active_days
+        if can_rescue_today and len(future_planned) < remaining_required:
             minutes_in_day = current_min % 1440
             wait_until_next_day = 1440 - minutes_in_day
             wait_min = max(1, min(wait_until_next_day, remaining))
-            _logger.info("偏好补救模式: day=%d, completed_idle=%d, wait=%d min",
-                         current_day, state.completed_idle_days, wait_min)
+            _logger.info("偏好补救模式: day=%d, completed_idle=%d, remaining_required=%d, wait=%d min",
+                         current_day, completed_idle, remaining_required, wait_min)
             return self._wait(wait_min)
 
         return None
@@ -2140,7 +2156,7 @@ class MultiDriverCoordinationLayer:
         self.active_decisions: dict[str, dict] = {}  # {driver_id: last_decision_info}
 
     def register_driver_profile(self, driver_id: str, preferences_text: str,
-                                home_location: tuple = None):
+                                home_location: tuple[float, float] | None = None):
         """注册司机画像"""
         profile = {
             "specialty": self._infer_specialty(preferences_text),
@@ -2442,8 +2458,7 @@ class ModelDecisionService:
                     decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
                     self._logger.info("快速接单(token降级) driver=%s cargo=%s",
                                       driver_id, candidates[0]["cargo_id"])
-                    self._update_state_after_decision(state, decision, current_min,
-                                                      candidates[0])
+                    self._update_state_after_decision(state, decision, current_min, candidates)
                     return decision
 
         # 10. Token 预算降级：超阈值时不调 LLM
@@ -2452,8 +2467,7 @@ class ModelDecisionService:
                 decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
             else:
                 decision = {"action": "wait", "params": {"duration_minutes": 60}}
-            self._update_state_after_decision(state, decision, current_min,
-                                              candidates[0] if candidates else None)
+            self._update_state_after_decision(state, decision, current_min, candidates)
             return decision
 
         # 10.5 Token预算智能分配检查（Task #6）
@@ -2482,8 +2496,7 @@ class ModelDecisionService:
             self._logger.info("Token智能分配跳过LLM driver=%s complexity=%s strategy=%s",
                               driver_id, _decision_complexity,
                               self.token_optimizer.suggest_strategy(driver_id, _remaining_steps))
-            self._update_state_after_decision(state, decision, current_min,
-                                              candidates[0] if candidates else None)
+            self._update_state_after_decision(state, decision, current_min, candidates)
             # Task #7: 记录决策到协调层
             self.coordination_layer.record_decision(
                 driver_id,
@@ -2504,7 +2517,7 @@ class ModelDecisionService:
         # 记录 token
         # (token 由 EmbeddedDecisionEnvironment 自动追踪，这里仅更新本地计数)
 
-        self._update_state_after_decision(state, decision, current_min, candidates[0] if candidates else None)
+        self._update_state_after_decision(state, decision, current_min, candidates)
 
         # Task #7: 记录决策到协调层
         self.coordination_layer.record_decision(
@@ -2516,7 +2529,7 @@ class ModelDecisionService:
         return decision
 
     def _update_state_after_decision(self, state: StateTracker, decision: dict,
-                                     current_min: int, top_candidate: dict | None = None) -> None:
+                                     current_min: int, candidates: list[dict] | None = None) -> None:
         """决策后更新本地状态跟踪。"""
         action = decision.get("action", "")
         params = decision.get("params", {})
@@ -2527,11 +2540,10 @@ class ModelDecisionService:
         elif action == "reposition":
             # 估算到达时间
             state.record_reposition(current_min)
-        elif action == "take_order" and top_candidate:
+        elif action == "take_order" and candidates:
             cargo_id = params.get("cargo_id", "")
-            # 找到匹配的候选
-            candidate = top_candidate
-            if candidate and candidate.get("cargo_id") == cargo_id:
+            candidate = next((c for c in candidates if c.get("cargo_id") == cargo_id), None)
+            if candidate:
                 state.record_take_order(
                     current_min,
                     candidate.get("price", 0),
