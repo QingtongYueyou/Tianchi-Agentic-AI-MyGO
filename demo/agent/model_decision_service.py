@@ -1509,7 +1509,7 @@ class RuleLayer:
         remaining = horizon - current_min
 
         # 0. 最高优先级：临时约定、家事、每日回家等强约束。
-        urgent_result = self._check_urgent_constraints(status, current_min, constraints, items)
+        urgent_result = self._check_urgent_constraints(status, current_min, constraints, items, state)
         if urgent_result is not None:
             return urgent_result
 
@@ -1554,10 +1554,25 @@ class RuleLayer:
         return None
 
     def _check_urgent_constraints(self, status: dict, current_min: int,
-                                  constraints: list[dict], items: list[dict] | None) -> dict | None:
+                                  constraints: list[dict], items: list[dict] | None,
+                                  state: "StateTracker | None" = None) -> dict | None:
+        # 构建 open task 类型集合，只对未完成任务触发规则
+        _open_types: set[str] = set()
+        _open_mandatory_ids: set[str] = set()
+        if state is not None:
+            for t in state.open_tasks:
+                tt = t.get("type", "")
+                _open_types.add(tt)
+                if tt == "mandatory_cargo":
+                    tid = str(t.get("target", ""))
+                    if tid:
+                        _open_mandatory_ids.add(tid)
+
         for c in constraints:
             ctype = c.get("type")
             if ctype == "scheduled_event":
+                if "scheduled_event" not in _open_types and state is not None:
+                    continue
                 decision = self._check_scheduled_event(status, current_min, c)
                 if decision:
                     return decision
@@ -1566,10 +1581,15 @@ class RuleLayer:
                 if decision:
                     return decision
             if ctype == "monthly_visit_requirement":
+                if "monthly_visit" not in _open_types and state is not None:
+                    continue
                 decision = self._check_monthly_visit_requirement(status, current_min, c)
                 if decision:
                     return decision
             if ctype == "mandatory_cargo":
+                cargo_id = str(c.get("params", {}).get("cargo_id", ""))
+                if state is not None and cargo_id not in _open_mandatory_ids:
+                    continue
                 decision = self._check_mandatory_cargo(status, current_min, c, items)
                 if decision:
                     return decision
@@ -3638,7 +3658,8 @@ class ModelDecisionService:
     def _try_reviewer_override(self, decision: dict, candidates: list[dict],
                                state: StateTracker, status: dict,
                                constraints: list[dict], current_min: int,
-                               driver_id: str) -> dict:
+                               driver_id: str,
+                               items: list[dict] | None = None) -> dict:
         """尝试用 DecisionReviewer 审核决策，返回（可能被否决后的）最终决策。
         用于快速接单/token降级等路径。"""
         try:
@@ -3657,6 +3678,7 @@ class ModelDecisionService:
                     _reviewer_dec = self._convert_review_to_decision(_result)
                     _validated = self._validate_reviewer_decision(
                         _reviewer_dec, candidates, status, constraints,
+                        items, state,
                     )
                     if _validated:
                         self._logger.info(
