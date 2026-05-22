@@ -1,0 +1,31 @@
+{
+  "month": "2026-03",
+  "simulate_time_seconds": 181.19,
+  "simulation_duration_days": 1,
+  "completed_steps": 46,
+  "remaining_cargo_count": 484021,
+  "driver_completed_steps": {
+    "D001": 3,
+    "D002": 2,
+    "D003": 4,
+    "D004": 3,
+    "D005": 5,
+    "D006": 5,
+    "D007": 6,
+    "D008": 5,
+    "D009": 7,
+    "D010": 6
+  },
+  "driver_result_files": {
+    "D001": "/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D001_20260522_110527.jsonl",
+    "D002": "/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D002_20260522_110527.jsonl",
+    "D003": "/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D003_20260522_110527.jsonl",
+    "D004": "/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D004_20260522_110527.jsonl",
+    "D005": "/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D005_20260522_110527.jsonl",
+    "D006": "/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D006_20260522_110527.jsonl",
+    "D007": "/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D007_20260522_110527.jsonl",
+    "D008": "/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D008_20260522_110527.jsonl",
+    "D009": "/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D009_20260522_110527.jsonl",
+    "D010": "/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D010_20260522_110527.jsonl"
+  }
+}

@@ -1,0 +1,232 @@
+2026-05-22 11:02:17,251 INFO [bench.evaluation_runner] evaluation begin config=default max_steps=(config)
+2026-05-22 11:02:34,758 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D001 items=0 scan_cost_min=0
+2026-05-22 11:02:34,758 INFO [agent.decision_service] decision input driver_id=D001 time_min=0 loc=(22.54000,114.06000) cargo_items=0
+2026-05-22 11:02:37,216 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:02:37,217 INFO [agent.decision_service] decision output driver_id=D001 action=wait params={'duration_minutes': 1}
+2026-05-22 11:02:37,217 INFO [bench.embedded_agent.engine] decision driver_id=D001 action=wait params={"duration_minutes":1} tokens prompt=276 completion=13 reasoning=0 total=289
+2026-05-22 11:02:37,220 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D001 items=3 scan_cost_min=1
+2026-05-22 11:02:37,221 INFO [agent.decision_service] decision input driver_id=D001 time_min=1 loc=(22.54000,114.06000) cargo_items=3
+2026-05-22 11:02:38,522 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:02:38,522 INFO [agent.decision_service] decision output driver_id=D001 action=take_order params={'cargo_id': '2'}
+2026-05-22 11:02:38,522 INFO [bench.embedded_agent.engine] decision driver_id=D001 action=take_order params={"cargo_id":"2"} tokens prompt=773 completion=14 reasoning=0 total=787
+2026-05-22 11:02:38,529 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D001 items=100 scan_cost_min=10
+2026-05-22 11:02:38,529 INFO [agent.decision_service] decision input driver_id=D001 time_min=739 loc=(22.53000,113.11000) cargo_items=100
+2026-05-22 11:02:40,499 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:02:40,499 INFO [agent.decision_service] decision output driver_id=D001 action=take_order params={'cargo_id': '222371'}
+2026-05-22 11:02:40,499 INFO [bench.embedded_agent.engine] decision driver_id=D001 action=take_order params={"cargo_id":"222371"} tokens prompt=3685 completion=19 reasoning=0 total=3704
+2026-05-22 11:02:48,729 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D002 items=0 scan_cost_min=0
+2026-05-22 11:02:48,731 INFO [agent.decision_service] decision input driver_id=D002 time_min=0 loc=(23.02000,113.75000) cargo_items=0
+2026-05-22 11:02:50,353 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:02:50,354 INFO [agent.decision_service] decision output driver_id=D002 action=wait params={'duration_minutes': 10}
+2026-05-22 11:02:50,354 INFO [bench.embedded_agent.engine] decision driver_id=D002 action=wait params={"duration_minutes":10} tokens prompt=276 completion=14 reasoning=0 total=290
+2026-05-22 11:02:50,357 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D002 items=18 scan_cost_min=2
+2026-05-22 11:02:50,358 INFO [agent.decision_service] decision input driver_id=D002 time_min=10 loc=(23.02000,113.75000) cargo_items=18
+2026-05-22 11:02:52,907 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:02:52,907 INFO [agent.decision_service] decision output driver_id=D002 action=take_order params={'cargo_id': '220561'}
+2026-05-22 11:02:52,907 INFO [bench.embedded_agent.engine] decision driver_id=D002 action=take_order params={"cargo_id":"220561"} tokens prompt=3315 completion=19 reasoning=0 total=3334
+2026-05-22 11:03:01,440 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D003 items=0 scan_cost_min=0
+2026-05-22 11:03:01,441 INFO [agent.decision_service] decision input driver_id=D003 time_min=0 loc=(23.03000,113.12000) cargo_items=0
+2026-05-22 11:03:03,150 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:03,151 INFO [agent.decision_service] decision output driver_id=D003 action=wait params={'duration_minutes': 30}
+2026-05-22 11:03:03,151 INFO [bench.embedded_agent.engine] decision driver_id=D003 action=wait params={"duration_minutes":30} tokens prompt=276 completion=14 reasoning=0 total=290
+2026-05-22 11:03:03,153 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D003 items=24 scan_cost_min=3
+2026-05-22 11:03:03,153 INFO [agent.decision_service] decision input driver_id=D003 time_min=30 loc=(23.03000,113.12000) cargo_items=24
+2026-05-22 11:03:04,786 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:04,786 INFO [agent.decision_service] decision output driver_id=D003 action=take_order params={'cargo_id': '220578'}
+2026-05-22 11:03:04,786 INFO [bench.embedded_agent.engine] decision driver_id=D003 action=take_order params={"cargo_id":"220578"} tokens prompt=3675 completion=19 reasoning=0 total=3694
+2026-05-22 11:03:04,787 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D003 items=54 scan_cost_min=6
+2026-05-22 11:03:04,787 INFO [agent.decision_service] decision input driver_id=D003 time_min=160 loc=(22.95000,114.35000) cargo_items=54
+2026-05-22 11:03:07,244 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:07,245 INFO [agent.decision_service] decision output driver_id=D003 action=take_order params={'cargo_id': '220593'}
+2026-05-22 11:03:07,245 INFO [bench.embedded_agent.engine] decision driver_id=D003 action=take_order params={"cargo_id":"220593"} tokens prompt=3659 completion=19 reasoning=0 total=3678
+2026-05-22 11:03:07,253 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D003 items=100 scan_cost_min=10
+2026-05-22 11:03:07,253 INFO [agent.decision_service] decision input driver_id=D003 time_min=757 loc=(22.77000,113.93000) cargo_items=100
+2026-05-22 11:03:11,035 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:11,039 INFO [agent.decision_service] decision output driver_id=D003 action=take_order params={'cargo_id': '307936'}
+2026-05-22 11:03:11,040 INFO [bench.embedded_agent.engine] decision driver_id=D003 action=take_order params={"cargo_id":"307936"} tokens prompt=3683 completion=19 reasoning=0 total=3702
+2026-05-22 11:03:19,742 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D004 items=0 scan_cost_min=0
+2026-05-22 11:03:19,742 INFO [agent.decision_service] decision input driver_id=D004 time_min=0 loc=(22.52000,113.39000) cargo_items=0
+2026-05-22 11:03:21,482 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:21,483 INFO [agent.decision_service] decision output driver_id=D004 action=wait params={'duration_minutes': 1}
+2026-05-22 11:03:21,483 INFO [bench.embedded_agent.engine] decision driver_id=D004 action=wait params={"duration_minutes":1} tokens prompt=276 completion=13 reasoning=0 total=289
+2026-05-22 11:03:21,485 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D004 items=3 scan_cost_min=1
+2026-05-22 11:03:21,485 INFO [agent.decision_service] decision input driver_id=D004 time_min=1 loc=(22.52000,113.39000) cargo_items=3
+2026-05-22 11:03:22,610 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:22,611 INFO [agent.decision_service] decision output driver_id=D004 action=take_order params={'cargo_id': '220577'}
+2026-05-22 11:03:22,612 INFO [bench.embedded_agent.engine] decision driver_id=D004 action=take_order params={"cargo_id":"220577"} tokens prompt=775 completion=19 reasoning=0 total=794
+2026-05-22 11:03:22,614 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D004 items=47 scan_cost_min=5
+2026-05-22 11:03:22,614 INFO [agent.decision_service] decision input driver_id=D004 time_min=94 loc=(23.34000,113.44000) cargo_items=47
+2026-05-22 11:03:25,353 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:25,354 INFO [agent.decision_service] decision output driver_id=D004 action=take_order params={'cargo_id': '220604'}
+2026-05-22 11:03:25,354 INFO [bench.embedded_agent.engine] decision driver_id=D004 action=take_order params={"cargo_id":"220604"} tokens prompt=3653 completion=19 reasoning=0 total=3672
+2026-05-22 11:03:34,163 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D005 items=0 scan_cost_min=0
+2026-05-22 11:03:34,164 INFO [agent.decision_service] decision input driver_id=D005 time_min=0 loc=(22.58000,113.08000) cargo_items=0
+2026-05-22 11:03:36,433 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:36,433 INFO [agent.decision_service] decision output driver_id=D005 action=wait params={'duration_minutes': 60}
+2026-05-22 11:03:36,434 INFO [bench.embedded_agent.engine] decision driver_id=D005 action=wait params={"duration_minutes":60} tokens prompt=276 completion=14 reasoning=0 total=290
+2026-05-22 11:03:36,435 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D005 items=37 scan_cost_min=4
+2026-05-22 11:03:36,436 INFO [agent.decision_service] decision input driver_id=D005 time_min=60 loc=(22.58000,113.08000) cargo_items=37
+2026-05-22 11:03:39,084 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:39,085 INFO [agent.decision_service] decision output driver_id=D005 action=take_order params={'cargo_id': '220573'}
+2026-05-22 11:03:39,086 INFO [bench.embedded_agent.engine] decision driver_id=D005 action=take_order params={"cargo_id":"220573"} tokens prompt=3661 completion=23 reasoning=0 total=3684
+2026-05-22 11:03:39,098 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D005 items=100 scan_cost_min=10
+2026-05-22 11:03:39,098 INFO [agent.decision_service] decision input driver_id=D005 time_min=832 loc=(23.13000,112.87000) cargo_items=100
+2026-05-22 11:03:40,834 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:40,835 INFO [agent.decision_service] decision output driver_id=D005 action=take_order params={'cargo_id': '223212'}
+2026-05-22 11:03:40,836 INFO [bench.embedded_agent.engine] decision driver_id=D005 action=take_order params={"cargo_id":"223212"} tokens prompt=3662 completion=19 reasoning=0 total=3681
+2026-05-22 11:03:40,841 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D005 items=100 scan_cost_min=10
+2026-05-22 11:03:40,842 INFO [agent.decision_service] decision input driver_id=D005 time_min=843 loc=(23.13000,112.87000) cargo_items=100
+2026-05-22 11:03:42,458 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:42,459 INFO [agent.decision_service] decision output driver_id=D005 action=wait params={'duration_minutes': 1}
+2026-05-22 11:03:42,459 INFO [bench.embedded_agent.engine] decision driver_id=D005 action=wait params={"duration_minutes":1} tokens prompt=3667 completion=13 reasoning=0 total=3680
+2026-05-22 11:03:42,466 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D005 items=100 scan_cost_min=10
+2026-05-22 11:03:42,466 INFO [agent.decision_service] decision input driver_id=D005 time_min=854 loc=(23.13000,112.87000) cargo_items=100
+2026-05-22 11:03:43,952 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:43,952 INFO [agent.decision_service] decision output driver_id=D005 action=take_order params={'cargo_id': '223594'}
+2026-05-22 11:03:43,953 INFO [bench.embedded_agent.engine] decision driver_id=D005 action=take_order params={"cargo_id":"223594"} tokens prompt=3666 completion=19 reasoning=0 total=3685
+2026-05-22 11:03:52,067 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D006 items=0 scan_cost_min=0
+2026-05-22 11:03:52,068 INFO [agent.decision_service] decision input driver_id=D006 time_min=0 loc=(23.11000,114.42000) cargo_items=0
+2026-05-22 11:03:54,214 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:54,214 INFO [agent.decision_service] decision output driver_id=D006 action=wait params={'duration_minutes': 30}
+2026-05-22 11:03:54,215 INFO [bench.embedded_agent.engine] decision driver_id=D006 action=wait params={"duration_minutes":30} tokens prompt=276 completion=14 reasoning=0 total=290
+2026-05-22 11:03:54,216 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D006 items=24 scan_cost_min=3
+2026-05-22 11:03:54,216 INFO [agent.decision_service] decision input driver_id=D006 time_min=30 loc=(23.11000,114.42000) cargo_items=24
+2026-05-22 11:03:55,996 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:55,997 INFO [agent.decision_service] decision output driver_id=D006 action=take_order params={'cargo_id': '220578'}
+2026-05-22 11:03:55,997 INFO [bench.embedded_agent.engine] decision driver_id=D006 action=take_order params={"cargo_id":"220578"} tokens prompt=3678 completion=19 reasoning=0 total=3697
+2026-05-22 11:03:56,000 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D006 items=100 scan_cost_min=10
+2026-05-22 11:03:56,000 INFO [agent.decision_service] decision input driver_id=D006 time_min=560 loc=(23.16000,112.95000) cargo_items=100
+2026-05-22 11:03:58,911 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:03:58,912 INFO [agent.decision_service] decision output driver_id=D006 action=take_order params={'cargo_id': '220838'}
+2026-05-22 11:03:58,913 INFO [bench.embedded_agent.engine] decision driver_id=D006 action=take_order params={"cargo_id":"220838"} tokens prompt=3666 completion=19 reasoning=0 total=3685
+2026-05-22 11:03:58,924 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D006 items=100 scan_cost_min=10
+2026-05-22 11:03:58,924 INFO [agent.decision_service] decision input driver_id=D006 time_min=913 loc=(22.68000,113.68000) cargo_items=100
+2026-05-22 11:04:00,611 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:00,612 INFO [agent.decision_service] decision output driver_id=D006 action=take_order params={'cargo_id': '221265'}
+2026-05-22 11:04:00,612 INFO [bench.embedded_agent.engine] decision driver_id=D006 action=take_order params={"cargo_id":"221265"} tokens prompt=3661 completion=19 reasoning=0 total=3680
+2026-05-22 11:04:00,618 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D006 items=100 scan_cost_min=10
+2026-05-22 11:04:00,618 INFO [agent.decision_service] decision input driver_id=D006 time_min=932 loc=(22.75000,113.71000) cargo_items=100
+2026-05-22 11:04:02,332 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:02,332 INFO [agent.decision_service] decision output driver_id=D006 action=take_order params={'cargo_id': '222524'}
+2026-05-22 11:04:02,332 INFO [bench.embedded_agent.engine] decision driver_id=D006 action=take_order params={"cargo_id":"222524"} tokens prompt=3683 completion=19 reasoning=0 total=3702
+2026-05-22 11:04:10,911 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D007 items=0 scan_cost_min=0
+2026-05-22 11:04:10,911 INFO [agent.decision_service] decision input driver_id=D007 time_min=0 loc=(23.05000,112.46000) cargo_items=0
+2026-05-22 11:04:14,553 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:14,553 INFO [agent.decision_service] decision output driver_id=D007 action=wait params={'duration_minutes': 1}
+2026-05-22 11:04:14,554 INFO [bench.embedded_agent.engine] decision driver_id=D007 action=wait params={"duration_minutes":1} tokens prompt=276 completion=13 reasoning=0 total=289
+2026-05-22 11:04:14,555 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D007 items=3 scan_cost_min=1
+2026-05-22 11:04:14,555 INFO [agent.decision_service] decision input driver_id=D007 time_min=1 loc=(23.05000,112.46000) cargo_items=3
+2026-05-22 11:04:16,996 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:16,998 INFO [agent.decision_service] decision output driver_id=D007 action=wait params={'duration_minutes': 1}
+2026-05-22 11:04:16,998 INFO [bench.embedded_agent.engine] decision driver_id=D007 action=wait params={"duration_minutes":1} tokens prompt=776 completion=13 reasoning=0 total=789
+2026-05-22 11:04:16,999 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D007 items=6 scan_cost_min=1
+2026-05-22 11:04:17,000 INFO [agent.decision_service] decision input driver_id=D007 time_min=3 loc=(23.05000,112.46000) cargo_items=6
+2026-05-22 11:04:18,535 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:18,535 INFO [agent.decision_service] decision output driver_id=D007 action=take_order params={'cargo_id': '3'}
+2026-05-22 11:04:18,535 INFO [bench.embedded_agent.engine] decision driver_id=D007 action=take_order params={"cargo_id":"3"} tokens prompt=1282 completion=14 reasoning=0 total=1296
+2026-05-22 11:04:18,546 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D007 items=100 scan_cost_min=10
+2026-05-22 11:04:18,546 INFO [agent.decision_service] decision input driver_id=D007 time_min=803 loc=(23.34000,113.27000) cargo_items=100
+2026-05-22 11:04:20,753 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:20,754 INFO [agent.decision_service] decision output driver_id=D007 action=take_order params={'cargo_id': '222585'}
+2026-05-22 11:04:20,754 INFO [bench.embedded_agent.engine] decision driver_id=D007 action=take_order params={"cargo_id":"222585"} tokens prompt=3652 completion=23 reasoning=0 total=3675
+2026-05-22 11:04:20,766 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D007 items=100 scan_cost_min=10
+2026-05-22 11:04:20,766 INFO [agent.decision_service] decision input driver_id=D007 time_min=1218 loc=(23.17000,113.86000) cargo_items=100
+2026-05-22 11:04:23,964 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:23,965 INFO [agent.decision_service] decision output driver_id=D007 action=take_order params={'cargo_id': '309624'}
+2026-05-22 11:04:23,966 INFO [bench.embedded_agent.engine] decision driver_id=D007 action=take_order params={"cargo_id":"309624"} tokens prompt=3664 completion=19 reasoning=0 total=3683
+2026-05-22 11:04:23,972 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D007 items=100 scan_cost_min=10
+2026-05-22 11:04:23,973 INFO [agent.decision_service] decision input driver_id=D007 time_min=1229 loc=(23.17000,113.86000) cargo_items=100
+2026-05-22 11:04:25,767 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:25,767 INFO [agent.decision_service] decision output driver_id=D007 action=take_order params={'cargo_id': '223813'}
+2026-05-22 11:04:25,768 INFO [bench.embedded_agent.engine] decision driver_id=D007 action=take_order params={"cargo_id":"223813"} tokens prompt=3663 completion=19 reasoning=0 total=3682
+2026-05-22 11:04:34,331 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D008 items=0 scan_cost_min=0
+2026-05-22 11:04:34,332 INFO [agent.decision_service] decision input driver_id=D008 time_min=0 loc=(22.27000,113.58000) cargo_items=0
+2026-05-22 11:04:35,434 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:35,435 INFO [agent.decision_service] decision output driver_id=D008 action=wait params={'duration_minutes': 10}
+2026-05-22 11:04:35,435 INFO [bench.embedded_agent.engine] decision driver_id=D008 action=wait params={"duration_minutes":10} tokens prompt=276 completion=14 reasoning=0 total=290
+2026-05-22 11:04:35,437 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D008 items=18 scan_cost_min=2
+2026-05-22 11:04:35,437 INFO [agent.decision_service] decision input driver_id=D008 time_min=10 loc=(22.27000,113.58000) cargo_items=18
+2026-05-22 11:04:36,569 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:36,570 INFO [agent.decision_service] decision output driver_id=D008 action=take_order params={'cargo_id': '306492'}
+2026-05-22 11:04:36,570 INFO [bench.embedded_agent.engine] decision driver_id=D008 action=take_order params={"cargo_id":"306492"} tokens prompt=3318 completion=19 reasoning=0 total=3337
+2026-05-22 11:04:36,572 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D008 items=50 scan_cost_min=5
+2026-05-22 11:04:36,572 INFO [agent.decision_service] decision input driver_id=D008 time_min=138 loc=(22.77000,114.68000) cargo_items=50
+2026-05-22 11:04:38,657 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:38,657 INFO [agent.decision_service] decision output driver_id=D008 action=take_order params={'cargo_id': '220575'}
+2026-05-22 11:04:38,658 INFO [bench.embedded_agent.engine] decision driver_id=D008 action=take_order params={"cargo_id":"220575"} tokens prompt=3669 completion=19 reasoning=0 total=3688
+2026-05-22 11:04:38,660 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D008 items=100 scan_cost_min=10
+2026-05-22 11:04:38,661 INFO [agent.decision_service] decision input driver_id=D008 time_min=507 loc=(22.73000,113.89000) cargo_items=100
+2026-05-22 11:04:41,225 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:41,226 INFO [agent.decision_service] decision output driver_id=D008 action=take_order params={'cargo_id': '306590'}
+2026-05-22 11:04:41,226 INFO [bench.embedded_agent.engine] decision driver_id=D008 action=take_order params={"cargo_id":"306590"} tokens prompt=3670 completion=19 reasoning=0 total=3689
+2026-05-22 11:04:41,237 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D008 items=100 scan_cost_min=10
+2026-05-22 11:04:41,238 INFO [agent.decision_service] decision input driver_id=D008 time_min=891 loc=(22.75000,113.19000) cargo_items=100
+2026-05-22 11:04:42,811 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:42,812 INFO [agent.decision_service] decision output driver_id=D008 action=take_order params={'cargo_id': '308326'}
+2026-05-22 11:04:42,813 INFO [bench.embedded_agent.engine] decision driver_id=D008 action=take_order params={"cargo_id":"308326"} tokens prompt=3678 completion=19 reasoning=0 total=3697
+2026-05-22 11:04:51,441 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D009 items=0 scan_cost_min=0
+2026-05-22 11:04:51,442 INFO [agent.decision_service] decision input driver_id=D009 time_min=0 loc=(23.12000,113.28000) cargo_items=0
+2026-05-22 11:04:52,638 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:52,638 INFO [agent.decision_service] decision output driver_id=D009 action=wait params={'duration_minutes': 1}
+2026-05-22 11:04:52,639 INFO [bench.embedded_agent.engine] decision driver_id=D009 action=wait params={"duration_minutes":1} tokens prompt=276 completion=13 reasoning=0 total=289
+2026-05-22 11:04:52,643 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D009 items=3 scan_cost_min=1
+2026-05-22 11:04:52,644 INFO [agent.decision_service] decision input driver_id=D009 time_min=1 loc=(23.12000,113.28000) cargo_items=3
+2026-05-22 11:04:54,683 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:54,684 INFO [agent.decision_service] decision output driver_id=D009 action=wait params={'duration_minutes': 60}
+2026-05-22 11:04:54,685 INFO [bench.embedded_agent.engine] decision driver_id=D009 action=wait params={"duration_minutes":60} tokens prompt=776 completion=14 reasoning=0 total=790
+2026-05-22 11:04:54,687 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D009 items=38 scan_cost_min=4
+2026-05-22 11:04:54,687 INFO [agent.decision_service] decision input driver_id=D009 time_min=62 loc=(23.12000,113.28000) cargo_items=38
+2026-05-22 11:04:55,843 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:55,843 INFO [agent.decision_service] decision output driver_id=D009 action=take_order params={'cargo_id': '306482'}
+2026-05-22 11:04:55,843 INFO [bench.embedded_agent.engine] decision driver_id=D009 action=take_order params={"cargo_id":"306482"} tokens prompt=3648 completion=19 reasoning=0 total=3667
+2026-05-22 11:04:55,847 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D009 items=100 scan_cost_min=10
+2026-05-22 11:04:55,847 INFO [agent.decision_service] decision input driver_id=D009 time_min=627 loc=(22.72000,112.97000) cargo_items=100
+2026-05-22 11:04:58,595 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:04:58,595 INFO [agent.decision_service] decision output driver_id=D009 action=take_order params={'cargo_id': '221962'}
+2026-05-22 11:04:58,595 INFO [bench.embedded_agent.engine] decision driver_id=D009 action=take_order params={"cargo_id":"221962"} tokens prompt=3680 completion=19 reasoning=0 total=3699
+2026-05-22 11:04:58,610 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D009 items=100 scan_cost_min=10
+2026-05-22 11:04:58,610 INFO [agent.decision_service] decision input driver_id=D009 time_min=1247 loc=(22.61000,114.27000) cargo_items=100
+2026-05-22 11:05:00,316 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:05:00,317 INFO [agent.decision_service] decision output driver_id=D009 action=take_order params={'cargo_id': '223965'}
+2026-05-22 11:05:00,318 INFO [bench.embedded_agent.engine] decision driver_id=D009 action=take_order params={"cargo_id":"223965"} tokens prompt=3660 completion=19 reasoning=0 total=3679
+2026-05-22 11:05:00,322 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D009 items=100 scan_cost_min=10
+2026-05-22 11:05:00,323 INFO [agent.decision_service] decision input driver_id=D009 time_min=1260 loc=(22.63000,114.26000) cargo_items=100
+2026-05-22 11:05:02,070 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:05:02,071 INFO [agent.decision_service] decision output driver_id=D009 action=take_order params={'cargo_id': '223658'}
+2026-05-22 11:05:02,071 INFO [bench.embedded_agent.engine] decision driver_id=D009 action=take_order params={"cargo_id":"223658"} tokens prompt=3656 completion=19 reasoning=0 total=3675
+2026-05-22 11:05:02,076 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D009 items=100 scan_cost_min=10
+2026-05-22 11:05:02,076 INFO [agent.decision_service] decision input driver_id=D009 time_min=1272 loc=(22.63000,114.25000) cargo_items=100
+2026-05-22 11:05:04,384 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:05:04,384 INFO [agent.decision_service] decision output driver_id=D009 action=take_order params={'cargo_id': '225530'}
+2026-05-22 11:05:04,384 INFO [bench.embedded_agent.engine] decision driver_id=D009 action=take_order params={"cargo_id":"225530"} tokens prompt=3655 completion=19 reasoning=0 total=3674
+2026-05-22 11:05:12,441 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D010 items=0 scan_cost_min=0
+2026-05-22 11:05:12,441 INFO [agent.decision_service] decision input driver_id=D010 time_min=0 loc=(23.19000,113.36000) cargo_items=0
+2026-05-22 11:05:14,157 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:05:14,158 INFO [agent.decision_service] decision output driver_id=D010 action=wait params={'duration_minutes': 60}
+2026-05-22 11:05:14,158 INFO [bench.embedded_agent.engine] decision driver_id=D010 action=wait params={"duration_minutes":60} tokens prompt=276 completion=18 reasoning=0 total=294
+2026-05-22 11:05:14,160 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D010 items=37 scan_cost_min=4
+2026-05-22 11:05:14,160 INFO [agent.decision_service] decision input driver_id=D010 time_min=60 loc=(23.19000,113.36000) cargo_items=37
+2026-05-22 11:05:15,483 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:05:15,484 INFO [agent.decision_service] decision output driver_id=D010 action=take_order params={'cargo_id': '306482'}
+2026-05-22 11:05:15,484 INFO [bench.embedded_agent.engine] decision driver_id=D010 action=take_order params={"cargo_id":"306482"} tokens prompt=3652 completion=19 reasoning=0 total=3671
+2026-05-22 11:05:15,491 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D010 items=100 scan_cost_min=10
+2026-05-22 11:05:15,491 INFO [agent.decision_service] decision input driver_id=D010 time_min=622 loc=(22.72000,112.97000) cargo_items=100
+2026-05-22 11:05:16,818 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:05:16,819 INFO [agent.decision_service] decision output driver_id=D010 action=wait params={'duration_minutes': 60}
+2026-05-22 11:05:16,820 INFO [bench.embedded_agent.engine] decision driver_id=D010 action=wait params={"duration_minutes":60} tokens prompt=3677 completion=14 reasoning=0 total=3691
+2026-05-22 11:05:16,824 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D010 items=100 scan_cost_min=10
+2026-05-22 11:05:16,824 INFO [agent.decision_service] decision input driver_id=D010 time_min=692 loc=(22.72000,112.97000) cargo_items=100
+2026-05-22 11:05:20,966 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:05:20,967 INFO [agent.decision_service] decision output driver_id=D010 action=wait params={'duration_minutes': 1}
+2026-05-22 11:05:20,968 INFO [bench.embedded_agent.engine] decision driver_id=D010 action=wait params={"duration_minutes":1} tokens prompt=3685 completion=13 reasoning=0 total=3698
+2026-05-22 11:05:20,972 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D010 items=100 scan_cost_min=10
+2026-05-22 11:05:20,973 INFO [agent.decision_service] decision input driver_id=D010 time_min=703 loc=(22.72000,112.97000) cargo_items=100
+2026-05-22 11:05:23,594 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:05:23,595 INFO [agent.decision_service] decision output driver_id=D010 action=take_order params={'cargo_id': '222575'}
+2026-05-22 11:05:23,595 INFO [bench.embedded_agent.engine] decision driver_id=D010 action=take_order params={"cargo_id":"222575"} tokens prompt=3690 completion=19 reasoning=0 total=3709
+2026-05-22 11:05:23,607 INFO [bench.embedded_agent.environment] query_cargo ok driver_id=D010 items=100 scan_cost_min=10
+2026-05-22 11:05:23,607 INFO [agent.decision_service] decision input driver_id=D010 time_min=1054 loc=(22.85000,112.87000) cargo_items=100
+2026-05-22 11:05:27,047 INFO [bench.embedded_agent.environment] model_chat_completion ok
+2026-05-22 11:05:27,048 INFO [agent.decision_service] decision output driver_id=D010 action=take_order params={'cargo_id': '309188'}
+2026-05-22 11:05:27,049 INFO [bench.embedded_agent.engine] decision driver_id=D010 action=take_order params={"cargo_id":"309188"} tokens prompt=3663 completion=19 reasoning=0 total=3682
+2026-05-22 11:05:27,081 INFO [bench.evaluation_runner] simulation finished results_dir=/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results summary={'completed_steps': 46, 'remaining_cargo_count': 484021, 'simulation_progress_minutes': 2146, 'simulation_wall_time': '2026-03-02 11:46:00', 'simulate_time_seconds': 181.19, 'driver_completed_steps': {'D001': 3, 'D002': 2, 'D003': 4, 'D004': 3, 'D005': 5, 'D006': 5, 'D007': 6, 'D008': 5, 'D009': 7, 'D010': 6}, 'driver_result_files': {'D001': '/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D001_20260522_110527.jsonl', 'D002': '/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D002_20260522_110527.jsonl', 'D003': '/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D003_20260522_110527.jsonl', 'D004': '/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D004_20260522_110527.jsonl', 'D005': '/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D005_20260522_110527.jsonl', 'D006': '/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D006_20260522_110527.jsonl', 'D007': '/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D007_20260522_110527.jsonl', 'D008': '/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D008_20260522_110527.jsonl', 'D009': '/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D009_20260522_110527.jsonl', 'D010': '/Users/yufeng.wang3/Desktop/demo_docs_release_20260509/demo/results/actions_202603_D010_20260522_110527.jsonl'}}
