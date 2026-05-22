@@ -665,6 +665,15 @@ class StateTracker:
         """返回距 deadline < 12小时(720分钟)的未完成紧急任务"""
         urgent = []
         for task in self.open_tasks:
+            task_type = task.get("type", "")
+            if task_type == "daily_home_deadline":
+                # daily_home_deadline 是每日重复约束，deadline_minute 是时间-of-day
+                deadline_minute_of_day = int(task.get("deadline_minute", 23 * 60))
+                current_minute_of_day = current_min % 1440
+                time_left = deadline_minute_of_day - current_minute_of_day
+                if 0 < time_left < 180:  # 距今日回家deadline不到3小时
+                    urgent.append(task)
+                continue
             deadline = task.get("deadline_minute")
             if deadline is not None:
                 try:
@@ -3506,28 +3515,34 @@ class ModelDecisionService:
 
             elif task_type == "daily_home_deadline":
                 # D009场景：每日回家deadline
-                # 检查是否快到今天的deadline了
-                deadline_hour = 23  # 默认23点
-                target_info = task.get("target", "")
-                if "hour=" in target_info:
-                    try:
-                        deadline_hour = int(target_info.split("hour=")[1].split(",")[0])
-                    except (ValueError, IndexError):
-                        pass
+                # 优先从任务字段直接读取，回退到旧的字符串解析
+                deadline_hour = task.get("deadline_hour")
+                if deadline_hour is None:
+                    deadline_hour = 23
+                    target_info = task.get("target", "")
+                    if "hour=" in target_info:
+                        try:
+                            deadline_hour = int(target_info.split("hour=")[1].split(",")[0])
+                        except (ValueError, IndexError):
+                            pass
+                try:
+                    deadline_hour = int(deadline_hour)
+                except (ValueError, TypeError):
+                    deadline_hour = 23
 
                 deadline_minute_today = deadline_hour * 60
                 time_left = deadline_minute_today - minute_in_day
 
                 if 0 < time_left < 180:  # 距回家deadline不到3小时
-                    # 尝试从 home_or_visit_plan 获取家的坐标
-                    home_lat, home_lng = None, None
-                    if state.strategic_plan:
+                    # 优先从任务字段直接读取坐标，回退到旧的多级查找
+                    home_lat = task.get("home_lat")
+                    home_lng = task.get("home_lng")
+                    if home_lat is None and state.strategic_plan:
                         for hvp in state.strategic_plan.get("home_or_visit_plan", []):
                             if hvp.get("day") == 0 or hvp.get("day") == day_index:
                                 home_lat = hvp.get("target_lat")
                                 home_lng = hvp.get("target_lng")
                                 break
-                    # 也尝试从约束中获取
                     if home_lat is None:
                         for c in constraints:
                             if c.get("type") == "daily_home_deadline":

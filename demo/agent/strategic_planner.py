@@ -191,11 +191,24 @@ class StrategicPlanner:
                     deadline_hour = int(p.get("deadline_hour", 23))
                 except (ValueError, TypeError):
                     deadline_hour = 23
+                home_lat = p.get("home_lat", 0)
+                home_lng = p.get("home_lng", 0)
                 allowed_home_plans.append({
                     "day": 0,
-                    "target_lat": p.get("home_lat", 0),
-                    "target_lng": p.get("home_lng", 0),
+                    "target_lat": home_lat,
+                    "target_lng": home_lng,
                     "deadline_minute": deadline_hour * 60,
+                })
+                # 同时加入 must_do_tasks，确保 set_strategic_plan 能收入 open_tasks
+                # 使 has_urgent_tasks / _handle_urgent_tasks 可达
+                allowed_tasks.append({
+                    "type": "daily_home_deadline",
+                    "target": "home",
+                    "home_lat": home_lat,
+                    "home_lng": home_lng,
+                    "deadline_hour": deadline_hour,
+                    "deadline_minute": deadline_hour * 60,
+                    "priority": 2,
                 })
 
         # 用白名单替换 LLM 幻觉的 must_do_tasks
@@ -271,11 +284,26 @@ class StrategicPlanner:
                     "priority": 2,
                 })
             elif ctype == "daily_home_deadline":
+                home_lat = params.get("home_lat", 0)
+                home_lng = params.get("home_lng", 0)
+                try:
+                    deadline_hour = int(params.get("deadline_hour", 23))
+                except (ValueError, TypeError):
+                    deadline_hour = 23
                 plan["home_or_visit_plan"].append({
                     "day": 0,  # 每天
-                    "target_lat": params.get("home_lat", 0),
-                    "target_lng": params.get("home_lng", 0),
-                    "deadline_minute": params.get("deadline_hour", 23) * 60,
+                    "target_lat": home_lat,
+                    "target_lng": home_lng,
+                    "deadline_minute": deadline_hour * 60,
+                })
+                plan["must_do_tasks"].append({
+                    "type": "daily_home_deadline",
+                    "target": "home",
+                    "home_lat": home_lat,
+                    "home_lng": home_lng,
+                    "deadline_hour": deadline_hour,
+                    "deadline_minute": deadline_hour * 60,
+                    "priority": 2,
                 })
             elif ctype == "day_off_requirement":
                 days_needed = params.get("min_days_off", 0)

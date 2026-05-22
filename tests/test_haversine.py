@@ -27,11 +27,17 @@ def _load_function_from_file(file_path: str, function_name: str):
     # 仅执行文件中纯函数所需的最小依赖
     import types
     fake_module = types.ModuleType("simkit")
+    fake_module.__path__ = []
+    fake_module.__package__ = "simkit"
+    fake_ports = types.ModuleType("simkit.ports")
+    fake_ports.__package__ = "simkit"
+    fake_ports.SimulationApiPort = type("SimulationApiPort", (), {})
     fake_cargo = types.ModuleType("simkit.cargo_repository")
     fake_driver = types.ModuleType("simkit.driver_state_manager")
     fake_cargo.CargoRepository = type("CargoRepository", (), {})
     fake_driver.DriverStateManager = type("DriverStateManager", (), {})
     sys.modules.setdefault("simkit", fake_module)
+    sys.modules.setdefault("simkit.ports", fake_ports)
     sys.modules.setdefault("simkit.cargo_repository", fake_cargo)
     sys.modules.setdefault("simkit.driver_state_manager", fake_driver)
     spec.loader.exec_module(module)
@@ -60,7 +66,7 @@ def _load_agent_haversine():
     except (ImportError, ModuleNotFoundError):
         # 如果有未满足的依赖，仅提取 haversine 纯函数源码执行
         import re
-        with open(_agent_path, "r") as f:
+        with open(_agent_path, "r", encoding="utf-8") as f:
             source = f.read()
         # 提取 haversine 函数定义
         pattern = r"(def haversine\(.*?\n(?:    .*\n)*)"
