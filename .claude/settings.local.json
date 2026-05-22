@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python3.12 *)",
-      "Bash(.venv/bin/python *)",
-      "Bash(git remote *)"
-    ]
-  }
-}
