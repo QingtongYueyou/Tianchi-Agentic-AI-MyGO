@@ -664,6 +664,14 @@ class StateTracker:
     def has_urgent_tasks(self, current_min: int) -> list[dict]:
         """返回距 deadline < 12小时(720分钟)的未完成紧急任务"""
         urgent = []
+        try:
+            horizon = max(
+                int(t.get("deadline_minute", 0))
+                for t in self.open_tasks
+                if t.get("deadline_minute") is not None
+            )
+        except (ValueError, TypeError):
+            horizon = _MONTH_TOTAL_MINUTES
         for task in self.open_tasks:
             task_type = task.get("type", "")
             if task_type == "daily_home_deadline":
@@ -674,6 +682,20 @@ class StateTracker:
                 if 0 < time_left < 180:  # 距今日回家deadline不到3小时
                     urgent.append(task)
                 continue
+            if task_type == "mandatory_cargo":
+                activation = _to_int_or_zero(task.get("activation_min"))
+                if activation > 0:
+                    if current_min >= activation or 0 < activation - current_min < 180:
+                        urgent.append(task)
+                    continue
+            if task_type == "monthly_visit":
+                min_days = _to_int_or_zero(task.get("min_visit_days")) or 1
+                total_days = max(1, math.ceil(horizon / 1440))
+                if total_days < min_days:
+                    continue
+                remaining_days = total_days - (_get_day_index(current_min) + 1)
+                if remaining_days >= min_days:
+                    continue
             deadline = task.get("deadline_minute")
             if deadline is not None:
                 try:
@@ -1729,6 +1751,7 @@ class RuleLayer:
         travel_min = _distance_to_minutes(dist)
         if dist > radius and current_min + travel_min + 30 >= deadline_min and current_min < deadline_min:
             return self._reposition(float(home_lat), float(home_lng))
+        # 已在家且非禁行时段：不拦截，继续搜索
         return None
 
     def _check_monthly_visit_requirement(self, status: dict, current_min: int, constraint: dict) -> dict | None:
@@ -1787,7 +1810,12 @@ class RuleLayer:
 
     def _check_forced_rest(self, current_min: int, state: StateTracker,
                            constraints: list[dict], horizon: int) -> dict | None:
-        """检查今天是否满足了最低连续休息要求，精确补足差额。"""
+        """检查今天是否满足了最低连续休息要求。
+
+        仅在当天剩余时间刚好只够补休时才强制 wait（精确到 need+30min）。
+        日常校验交给 _validate_take_order_constraints 的 daily_rest 检查，
+        避免规则层过早阻断导致无法搜索短单。
+        """
         for c in constraints:
             if c.get("type") != "daily_rest":
                 continue
@@ -1799,9 +1827,9 @@ class RuleLayer:
             if current_rest >= required_min:
                 continue  # 已满足，无需强制
             remaining_today = 1440 - (current_min % 1440)
-            # 只在今天剩余时间不够"再接单+补休"时才强制
             need = required_min - current_rest
-            if remaining_today <= need + 60:
+            # 仅在剩余时间刚好只够补休时才强制（留给搜索层更多机会）
+            if remaining_today <= need + 30:
                 remaining_total = horizon - current_min
                 wait_min = max(1, min(need, remaining_today, remaining_total))
                 return self._wait(wait_min)
@@ -2066,7 +2094,8 @@ class HeuristicLayer:
                 finish_min, int(mp.get("window_end", activation)), 0.0,
             )
 
-        return cost
+        # 上限封顶：防止远距离终点把评分打爆
+        return min(cost, 200.0)
 
     @staticmethod
     def _build_mandatory_pickup_info(
@@ -2213,16 +2242,39 @@ class HeuristicLayer:
             if _violates_time_restriction(current_min, current_min + total_time, constraints):
                 continue
 
+            # 过滤: 接单后当天剩余时间不够补足连续休息
+            _finish = current_min + total_time
+            for _c in constraints:
+                if _c.get("type") != "daily_rest":
+                    continue
+                _rp = _c.get("params", {})
+                _req = int(_rp.get("min_continuous_minutes", 0))
+                if _req <= 0:
+                    continue
+                _cur_rest = state.get_max_continuous_rest_today(current_min)
+                if _cur_rest >= _req:
+                    break
+                _need = _req - _cur_rest
+                _remain_after = 1440 - (_finish % 1440)
+                if _remain_after < _need:
+                    total_time = -1  # mark as invalid
+                    break
+            if total_time < 0:
+                continue
+
             # 过滤: 候选完成后赶不到 mandatory_cargo pickup 的订单
-            # 用 window_end（装货窗结束）或 activation_min（上架时间）判断
+            # 仅在 mandatory 窗口临近（<12h）时才硬过滤，否则交给评分惩罚
             if mandatory_pickups and cargo_id not in mandatory_cargo_ids:
                 finish_min = current_min + total_time
                 _skip_for_mandatory = False
                 for mp in mandatory_pickups:
+                    deadline = mp.get("window_end", mp["activation_min"])
+                    # 远期（>12h）：不过滤，由 future_position_cost 惩罚
+                    if deadline - current_min > 720:
+                        continue
                     travel_to_pickup = _distance_to_minutes(
                         haversine(end_lat, end_lng, mp["pickup_lat"], mp["pickup_lng"])
                     )
-                    deadline = mp.get("window_end", mp["activation_min"])
                     if finish_min + travel_to_pickup > deadline:
                         _skip_for_mandatory = True
                         break
@@ -2320,7 +2372,7 @@ class HeuristicLayer:
                 - deadhead_penalty
                 - future_position_cost
                 + cluster_value
-                + net_profit * 0.15
+                + net_profit * 0.25
                 + scarcity_factor
                 - idle_day_penalty
             )
@@ -2578,7 +2630,7 @@ class LLMLayer:
 
     def _fallback(self, candidates: list[dict]) -> dict:
         """兜底：有高分候选就接单，否则等待。"""
-        if candidates and candidates[0].get("score", 0) > 0 and candidates[0].get("penalty_score", 0) == 0:
+        if candidates and candidates[0].get("score", 0) > -50 and candidates[0].get("penalty_score", 0) == 0:
             return {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
         return self._default_wait()
 
@@ -3128,6 +3180,22 @@ class ModelDecisionService:
                 if finish_min + travel_to_visit > day_end:
                     return False, "cannot_reach_visit_point_today"
 
+        # 9. daily_rest：接单后当天剩余时间必须足够补足连续休息
+        for c in constraints:
+            if c.get("type") != "daily_rest":
+                continue
+            params = c.get("params", {})
+            required_min = int(params.get("min_continuous_minutes", 0))
+            if required_min <= 0:
+                continue
+            current_rest = state.get_max_continuous_rest_today(current_min)
+            if current_rest >= required_min:
+                continue  # 已满足
+            need = required_min - current_rest
+            remaining_after_order = 1440 - (finish_min % 1440)
+            if remaining_after_order < need:
+                return False, "order_prevents_daily_rest_completion"
+
         return True, ""
 
     def _decide_impl(self, driver_id: str) -> dict:
@@ -3405,10 +3473,10 @@ class ModelDecisionService:
 
         # 9. 快速接单路径：如果最优候选评分远超第二，且无违规，直接接单
         if (len(candidates) >= 1 and
-                candidates[0]["score"] > 0 and
+                candidates[0]["score"] > -50 and
                 candidates[0]["penalty_score"] == 0 and
-                candidates[0]["net_profit"] > 50):
-            if len(candidates) == 1 or candidates[0]["score"] > candidates[1]["score"] * 1.5:
+                candidates[0]["net_profit"] > 80):
+            if len(candidates) == 1 or candidates[0]["score"] > candidates[1]["score"] * 1.3:
                 # Token 预算紧张时直接用启发式结果
                 if state.is_token_budget_exceeded():
                     decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
@@ -3435,7 +3503,7 @@ class ModelDecisionService:
 
         # 10. Token 预算降级：超阈值时不调 LLM
         if state.is_token_budget_exceeded():
-            if candidates and candidates[0]["score"] > 0 and candidates[0]["penalty_score"] == 0:
+            if candidates and candidates[0]["score"] > -50 and candidates[0]["penalty_score"] == 0:
                 _cid = candidates[0]["cargo_id"]
                 if self._validate_take_order_feasibility(_cid, items, status_after_query):
                     ok, reason = self._validate_take_order_constraints(
@@ -3462,7 +3530,7 @@ class ModelDecisionService:
         # 10.5 Token预算智能分配检查（Task #6）
         if not self.token_optimizer.should_use_llm(driver_id, _decision_complexity, _remaining_steps):
             # Token预算建议不使用LLM，直接用启发式结果
-            if candidates and candidates[0]["score"] > 0 and candidates[0]["penalty_score"] == 0:
+            if candidates and candidates[0]["score"] > -50 and candidates[0]["penalty_score"] == 0:
                 _cid = candidates[0]["cargo_id"]
                 if self._validate_take_order_feasibility(_cid, items, status_after_query):
                     ok, reason = self._validate_take_order_constraints(
@@ -3611,13 +3679,7 @@ class ModelDecisionService:
                 # 如果快到deadline了，我们不能主动接（需要在货源出现时接），
                 # 但可以让司机等待在当前位置，不要跑远
                 # 返回短时等待，后续主流程中若看到指定货源会优先接
-                target_cargo = str(task.get("target", ""))
-                if target_cargo:
-                    # 短时等待策略：不要离开，等熟货出现
-                    return {
-                        "action": "wait",
-                        "params": {"duration_minutes": 30}
-                    }
+                continue
 
             elif task_type == "monthly_visit":
                 # D010场景：到访指定点

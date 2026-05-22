@@ -144,6 +144,8 @@ class StrategicPlanner:
                     "type": "mandatory_cargo",
                     "target": cargo_id,
                     "activation_min": activation,
+                    "pickup_lat": p.get("pickup_lat"),
+                    "pickup_lng": p.get("pickup_lng"),
                     "deadline_minute": horizon_minutes,
                     "priority": 1,
                 })
@@ -236,9 +238,16 @@ class StrategicPlanner:
             ctype = c.get("type", "")
             params = c.get("params", {})
             if ctype == "mandatory_cargo":
+                try:
+                    activation = int(params.get("activation_min", 0))
+                except (ValueError, TypeError):
+                    activation = 0
                 plan["must_do_tasks"].append({
                     "type": "mandatory_cargo",
                     "target": str(params.get("cargo_id", "")),
+                    "activation_min": activation,
+                    "pickup_lat": params.get("pickup_lat"),
+                    "pickup_lng": params.get("pickup_lng"),
                     "deadline_minute": horizon_minutes,
                     "priority": 1,
                 })

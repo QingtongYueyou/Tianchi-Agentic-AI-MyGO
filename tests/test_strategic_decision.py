@@ -264,6 +264,34 @@ class TestMonthlyVisitFallback:
         assert visits[0]["target"] == "lat=22.5,lng=114.0"
 
 
+class TestUrgentTaskDeferral:
+    """Future monthly tasks should not short-circuit cargo search in short runs."""
+
+    def test_future_mandatory_cargo_not_urgent_before_activation(self):
+        state = StateTracker()
+        state.open_tasks = [{
+            "type": "mandatory_cargo",
+            "target": "240646",
+            "activation_min": 3848,
+            "deadline_minute": 1440,
+            "priority": 1,
+        }]
+
+        assert state.has_urgent_tasks(900) == []
+
+    def test_short_run_monthly_visit_not_urgent(self):
+        state = StateTracker()
+        state.open_tasks = [{
+            "type": "monthly_visit",
+            "target": "lat=23.13,lng=113.26",
+            "min_visit_days": 5,
+            "deadline_minute": 1440,
+            "priority": 2,
+        }]
+
+        assert state.has_urgent_tasks(900) == []
+
+
 # ═══════════════════════════════════════════════════════════════
 # Fix #3: _try_reviewer_override 存在性验证
 # ═══════════════════════════════════════════════════════════════
