@@ -11,6 +11,9 @@ from typing import Any
 
 from simkit.ports import SimulationApiPort
 
+from .strategic_planner import StrategicPlanner
+from .decision_reviewer import DecisionReviewer
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 常量
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,6 +51,16 @@ def _distance_to_minutes(distance_km: float, speed: float = _SPEED_KM_H) -> int:
     if distance_km <= 0:
         return 1
     return max(1, math.ceil(distance_km / speed * 60))
+
+
+def _to_int_or_zero(val: Any) -> int:
+    """安全转 int，None/非数字一律返回 0。"""
+    if val is None:
+        return 0
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return 0
 
 
 def _sim_minutes_to_wall(sim_min: int) -> datetime:
@@ -98,6 +111,11 @@ class MonthlyConstraintPlanner:
         self.total_days = total_days
         self.required_idle_days = self._parse_idle_days_requirement(preferences_text)
         self.planned_idle_days: list[int] = self._generate_idle_plan()
+        # --- 战略计划扩展 ---
+        self.rest_plan: list[dict] = []           # 来自战略计划的休息安排
+        self.home_visit_plan: list[dict] = []     # 回家/到访计划
+        self.scheduled_events: list[dict] = []    # 家事/固定事件
+        self.mandatory_cargos: list[dict] = []    # 必接货源
 
     def _parse_idle_days_requirement(self, text: str) -> int:
         """解析偏好文本中需要几个整天不接单/不活动。"""
@@ -178,6 +196,43 @@ class MonthlyConstraintPlanner:
         # 剩余天数刚好等于或少于剩余需求时触发补救
         return remaining_available_days <= remaining_required
 
+    def integrate_strategic_plan(self, plan: dict) -> None:
+        """整合战略计划中的月度级约束"""
+        self.rest_plan = plan.get("rest_plan", [])
+        self.home_visit_plan = plan.get("home_or_visit_plan", [])
+        # 从 must_do_tasks 中提取分类
+        for task in plan.get("must_do_tasks", []):
+            task_type = task.get("type", "")
+            if task_type == "scheduled_event":
+                self.scheduled_events.append(task)
+            elif task_type in ("mandatory_cargo",):
+                self.mandatory_cargos.append(task)
+        # 更新 planned_idle_days（如果战略计划给出了更优的休息日安排）
+        strategic_rest_days = [
+            r["day"] for r in self.rest_plan
+            if r.get("type") == "full_day" and isinstance(r.get("day"), int)
+        ]
+        if strategic_rest_days and len(strategic_rest_days) >= self.required_idle_days:
+            self.planned_idle_days = sorted(strategic_rest_days[:self.required_idle_days])
+
+    def get_day_plan(self, day_index: int) -> dict:
+        """获取指定日的月度计划"""
+        return {
+            "is_planned_idle": day_index in self.planned_idle_days,
+            "has_event": any(
+                e.get("deadline_minute", 0) // 1440 == day_index or e.get("day") == day_index
+                for e in self.scheduled_events
+            ),
+            "has_visit": any(
+                v.get("day") == day_index or v.get("day") == 0  # day=0 means every day
+                for v in self.home_visit_plan
+            ),
+            "mandatory_cargo": [
+                c for c in self.mandatory_cargos
+                # mandatory cargo 没有特定日期限制，全月有效
+            ] if day_index > 0 else [],
+        }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # StateTracker - 状态追踪器
@@ -208,6 +263,15 @@ class StateTracker:
         self.completed_idle_days: int = 0
         # 货源出现频率统计 (hour_slot -> count)（Task #2）
         self.cargo_frequency: dict[int, int] = {}
+        # --- 战略计划相关 ---
+        self.strategic_plan: dict | None = None
+        self.open_tasks: list[dict] = []        # 未完成的 must_do_tasks
+        self.completed_tasks: list[dict] = []   # 已完成的任务
+        self.risk_register: list[dict] = []     # 活跃风险
+        self.daily_intent: dict | None = None   # 当日策略意图
+        self.last_llm_review_minute: int = -1   # 上次 reviewer 调用时间
+        self.consecutive_review_waits: int = 0  # reviewer 连续输出 wait 的次数
+        self.last_review_reason: str = ""       # 上次 reviewer 否决原因
 
     def initialize_from_history(self, api: SimulationApiPort, driver_id: str) -> None:
         """首次调用时从历史决策恢复状态。"""
@@ -399,6 +463,190 @@ class StateTracker:
         """获取当前时段的历史平均货源数量。"""
         hour_slot = int(_get_hour_of_day(current_min))
         return float(self.cargo_frequency.get(hour_slot, 3))  # 默认中频
+
+    def set_strategic_plan(self, plan: dict) -> None:
+        """设置战略计划并初始化任务列表"""
+        self.strategic_plan = plan
+        self.open_tasks = list(plan.get("must_do_tasks", []))
+        self.risk_register = list(plan.get("risk_windows", []))
+
+    def update_task_progress(self, current_min: int, history: list[dict]) -> None:
+        """根据历史记录刷新任务完成状态"""
+        if not self.open_tasks:
+            return
+        newly_completed = []
+        for task in self.open_tasks:
+            task_type = task.get("type", "")
+            if task_type == "mandatory_cargo":
+                # 检查历史中是否接了指定 cargo_id（嵌套结构: rec.action.params.cargo_id）
+                target_cargo = str(task.get("target", ""))
+                for h in history:
+                    action = h.get("action", {})
+                    if action.get("action") == "take_order":
+                        cargo_id = str(action.get("params", {}).get("cargo_id", ""))
+                        if cargo_id == target_cargo:
+                            newly_completed.append(task)
+                            break
+            elif task_type == "scheduled_event":
+                # 家事事件：保守完成判断
+                # 必须能从历史看出"先到 pickup，再到 home"的顺序
+                # 如果 release_min 有值，还要有 home 附近的 wait/position_after 覆盖到 release 后
+                release_min = _to_int_or_zero(task.get("release_min"))
+                home_deadline_min = _to_int_or_zero(task.get("home_deadline_min"))
+                effective_deadline = release_min if release_min > 0 else home_deadline_min
+                if effective_deadline > 0 and current_min < effective_deadline:
+                    continue
+
+                pickup_lat = task.get("pickup_lat")
+                pickup_lng = task.get("pickup_lng")
+                home_lat = task.get("home_lat")
+                home_lng = task.get("home_lng")
+
+                _PROXIMITY_DEG = 0.02  # ~1km
+
+                def _first_visit_sim_min(t_lat, t_lng, radius=_PROXIMITY_DEG):
+                    """返回第一次到达目标附近的 sim_min，未到达返回 -1"""
+                    if t_lat is None or t_lng is None:
+                        return -1
+                    for h in history:
+                        pos = h.get("position_after", {})
+                        h_lat = pos.get("lat")
+                        h_lng = pos.get("lng")
+                        if h_lat is not None and h_lng is not None:
+                            if (abs(float(h_lat) - float(t_lat)) < radius and
+                                    abs(float(h_lng) - float(t_lng)) < radius):
+                                result_h = h.get("result", {})
+                                if "simulation_progress_minutes" in result_h:
+                                    return int(result_h["simulation_progress_minutes"])
+                    return -1
+
+                pickup_visit_min = _first_visit_sim_min(pickup_lat, pickup_lng)
+                home_visit_min = _first_visit_sim_min(home_lat, home_lng)
+
+                # 必须到过两个点，且 pickup 在 home 之前
+                if pickup_visit_min < 0 or home_visit_min < 0:
+                    continue
+                if home_visit_min <= pickup_visit_min:
+                    continue
+
+                # 如果 release_min 有值，需要 home 附近有覆盖 release 后的证据
+                if release_min > 0:
+                    home_covered_after_release = False
+                    for h in history:
+                        pos = h.get("position_after", {})
+                        h_lat = pos.get("lat")
+                        h_lng = pos.get("lng")
+                        if h_lat is None or h_lng is None:
+                            continue
+                        if (home_lat is not None and home_lng is not None and
+                                abs(float(h_lat) - float(home_lat)) < _PROXIMITY_DEG and
+                                abs(float(h_lng) - float(home_lng)) < _PROXIMITY_DEG):
+                            sim_min = 0
+                            result_h = h.get("result", {})
+                            if "simulation_progress_minutes" in result_h:
+                                sim_min = int(result_h["simulation_progress_minutes"])
+                            action = h.get("action", {})
+                            duration = 0
+                            if action.get("action") == "wait":
+                                try:
+                                    duration = int(action.get("params", {}).get("duration_minutes", 0))
+                                except (ValueError, TypeError):
+                                    duration = 0
+                            start_of_record = sim_min - duration if duration > 0 else sim_min
+                            if start_of_record >= release_min:
+                                home_covered_after_release = True
+                                break
+                            if sim_min >= release_min:
+                                home_covered_after_release = True
+                                break
+                    if not home_covered_after_release:
+                        continue
+
+                newly_completed.append(task)
+            elif task_type == "monthly_visit":
+                # 到访：需要在不同自然日到达指定点附近，达到 min_visit_days 才完成
+                target_str = task.get("target", "")
+                if "lat=" in target_str and "lng=" in target_str:
+                    try:
+                        parts = target_str.split(",")
+                        t_lat = float(parts[0].split("=")[1])
+                        t_lng = float(parts[1].split("=")[1])
+                        min_days = task.get("min_visit_days", 1)
+                        if isinstance(min_days, str):
+                            min_days = int(min_days)
+                        if min_days < 1:
+                            min_days = 1
+                        visited_days: set[int] = set()
+                        for h in history:
+                            pos = h.get("position_after", {})
+                            h_lat = pos.get("lat")
+                            h_lng = pos.get("lng")
+                            if h_lat is not None and h_lng is not None:
+                                if (abs(float(h_lat) - t_lat) < 0.05 and
+                                        abs(float(h_lng) - t_lng) < 0.05):
+                                    # 从历史记录推算 sim 时间
+                                    sim_min = 0
+                                    result_h = h.get("result", {})
+                                    if "simulation_progress_minutes" in result_h:
+                                        sim_min = int(result_h["simulation_progress_minutes"])
+                                    elif "simulation_end_time" in h:
+                                        try:
+                                            sim_min = _wall_to_sim_minutes(h["simulation_end_time"] + ":00")
+                                        except Exception:
+                                            pass
+                                    if sim_min > 0:
+                                        day = sim_min // 1440
+                                        visited_days.add(day)
+                        if len(visited_days) >= min_days:
+                            newly_completed.append(task)
+                    except (ValueError, IndexError):
+                        pass
+            elif task_type == "day_off_requirement":
+                # 复用 idle_days 统计
+                min_days = task.get("min_days_off", 0)
+                if isinstance(min_days, str):
+                    try:
+                        min_days = int(min_days)
+                    except ValueError:
+                        min_days = 0
+                if self.completed_idle_days >= min_days:
+                    newly_completed.append(task)
+
+            elif task_type == "daily_home_deadline":
+                # 回家deadline：这是每天重复的，不标记为完成
+                # 但如果当天已回家（当前在家附近），可以暂时标记
+                pass  # 每天重复，不从 open_tasks 移除
+
+        for task in newly_completed:
+            if task in self.open_tasks:
+                self.open_tasks.remove(task)
+                self.completed_tasks.append(task)
+
+    def get_daily_intent(self, day_index: int) -> dict | None:
+        """获取指定日的策略意图"""
+        if self.strategic_plan and "daily_strategy" in self.strategic_plan:
+            strategies = self.strategic_plan["daily_strategy"]
+            for s in strategies:
+                if s.get("day") == day_index:
+                    return s
+            # 尝试按索引获取
+            if 0 < day_index <= len(strategies):
+                return strategies[day_index - 1]
+        return self.daily_intent
+
+    def has_urgent_tasks(self, current_min: int) -> list[dict]:
+        """返回距 deadline < 12小时(720分钟)的未完成紧急任务"""
+        urgent = []
+        for task in self.open_tasks:
+            deadline = task.get("deadline_minute")
+            if deadline is not None:
+                try:
+                    deadline_val = int(deadline)
+                    if 0 < deadline_val - current_min < 720:
+                        urgent.append(task)
+                except (ValueError, TypeError):
+                    pass
+        return urgent
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1333,7 +1581,10 @@ class RuleLayer:
         cargo_id = str(params.get("cargo_id", "")).strip()
         if not cargo_id:
             return None
-        activation = int(params.get("activation_min", current_min))
+        try:
+            activation = int(params.get("activation_min", current_min))
+        except (ValueError, TypeError):
+            activation = current_min
         pickup_lat = params.get("pickup_lat")
         pickup_lng = params.get("pickup_lng")
         lat = float(status.get("current_lat", 0))
@@ -1641,6 +1892,75 @@ class HeuristicLayer:
         cluster_value = spatial_value * 0.01 + neighbor_value * 0.005
         return min(cluster_value, 80.0)  # 封顶80
 
+    @staticmethod
+    def _build_mandatory_pickup_info(
+        state: StateTracker, constraints: list[dict],
+        items: list[dict] | None = None,
+    ) -> list[dict]:
+        """从 open_tasks + constraints 提取 mandatory_cargo 的 pickup 信息。
+
+        返回列表，每项: {cargo_id, activation_min, window_end, pickup_lat, pickup_lng}
+        仅包含有 activation_min + pickup 坐标的 mandatory 任务。
+        """
+        # 从 constraints 建 cargo_id -> params 索引
+        cargo_params: dict[str, dict] = {}
+        for c in constraints:
+            if c.get("type") == "mandatory_cargo":
+                params = c.get("params", {})
+                cid = str(params.get("cargo_id", ""))
+                if cid:
+                    cargo_params[cid] = params
+
+        # 从 items 建 cargo_id -> load_time 索引（用于取装货窗结束时间）
+        cargo_window_end: dict[str, int] = {}
+        if items:
+            for it in items:
+                cargo = it.get("cargo", {})
+                cid = str(cargo.get("cargo_id", ""))
+                load_time = cargo.get("load_time")
+                if cid and load_time and isinstance(load_time, list) and len(load_time) >= 2:
+                    try:
+                        cargo_window_end[cid] = _wall_to_sim_minutes(str(load_time[1]).strip())
+                    except Exception:
+                        pass
+
+        result: list[dict] = []
+        if not hasattr(state, "open_tasks"):
+            return result
+        for task in state.open_tasks:
+            if task.get("type") != "mandatory_cargo":
+                continue
+            cargo_id = str(task.get("target", ""))
+            if not cargo_id:
+                continue
+            params = cargo_params.get(cargo_id, {})
+            # 也尝试从 task 自身取（fallback plan 可能直接放了这些字段）
+            activation_min = params.get("activation_min") or task.get("activation_min")
+            pickup_lat = params.get("pickup_lat") or task.get("pickup_lat")
+            pickup_lng = params.get("pickup_lng") or task.get("pickup_lng")
+            if activation_min is None or pickup_lat is None or pickup_lng is None:
+                continue
+            try:
+                entry = {
+                    "cargo_id": cargo_id,
+                    "activation_min": int(activation_min),
+                    "pickup_lat": float(pickup_lat),
+                    "pickup_lng": float(pickup_lng),
+                }
+                # window_end: 装货时间窗结束，比 activation 更精确的截止点
+                # 优先从 constraint/task 取，其次从 items 的 load_time 取
+                window_end = (params.get("window_end") or task.get("window_end")
+                              or cargo_window_end.get(cargo_id))
+                if window_end is not None:
+                    try:
+                        entry["window_end"] = int(window_end)
+                    except (ValueError, TypeError):
+                        pass
+                result.append(entry)
+            except (ValueError, TypeError):
+                continue
+        return result
+
     def score_and_rank(self, items: list[dict], status: dict, state: StateTracker,
                        constraints: list[dict], top_n: int = 5) -> list[dict]:
         """评分并返回 Top N 候选（Task #2 优化评分公式）。"""
@@ -1664,6 +1984,18 @@ class HeuristicLayer:
 
         scored = []
 
+        # 收集 mandatory_cargo 目标 cargo_id（这些不应被 hard_banned 过滤）
+        mandatory_cargo_ids: set[str] = set()
+        if hasattr(state, 'open_tasks'):
+            for _t in state.open_tasks:
+                if _t.get("type") == "mandatory_cargo":
+                    tid = str(_t.get("target", ""))
+                    if tid:
+                        mandatory_cargo_ids.add(tid)
+
+        # 收集 mandatory_cargo 的 pickup 信息（用于过滤赶不到的候选）
+        mandatory_pickups = self._build_mandatory_pickup_info(state, constraints, items)
+
         for item in items:
             cargo = item.get("cargo", {})
             distance_km = float(item.get("distance_km", 0))
@@ -1680,7 +2012,8 @@ class HeuristicLayer:
             cargo_name = cargo.get("cargo_name", "")
 
             # 过滤: 仅硬禁品类先剔除；软偏好品类留下通过评分惩罚
-            if any(b in cargo_name for b in hard_banned):
+            # mandatory_cargo 目标跳过此过滤（熟货优先）
+            if any(b in cargo_name for b in hard_banned) and cargo_id not in mandatory_cargo_ids:
                 continue
 
             # 过滤: 装货时间窗已过期
@@ -1703,6 +2036,22 @@ class HeuristicLayer:
                 continue
             if self._violates_time_restriction(current_min, current_min + total_time, constraints):
                 continue
+
+            # 过滤: 候选完成后赶不到 mandatory_cargo pickup 的订单
+            # 用 window_end（装货窗结束）或 activation_min（上架时间）判断
+            if mandatory_pickups and cargo_id not in mandatory_cargo_ids:
+                finish_min = current_min + total_time
+                _skip_for_mandatory = False
+                for mp in mandatory_pickups:
+                    travel_to_pickup = _distance_to_minutes(
+                        haversine(end_lat, end_lng, mp["pickup_lat"], mp["pickup_lng"])
+                    )
+                    deadline = mp.get("window_end", mp["activation_min"])
+                    if finish_min + travel_to_pickup > deadline:
+                        _skip_for_mandatory = True
+                        break
+                if _skip_for_mandatory:
+                    continue
 
             # 计算干线距离
             haul_km = haversine(start_lat, start_lng, end_lat, end_lng)
@@ -2164,8 +2513,19 @@ class TokenBudgetOptimizer:
         else:
             return "RULE_HEURISTIC_ONLY"  # Token紧张，仅用规则+启发式
 
-    def should_use_llm(self, driver_id: str, decision_complexity: str, remaining_steps: int) -> bool:
+    def should_use_llm(self, driver_id: str, decision_complexity: str, remaining_steps: int,
+                       context: str = "decision") -> bool:
         """判断当前决策是否应该调用LLM"""
+        # 战略规划必调
+        if context == "strategic_plan":
+            return True
+        # 高风险审核：仅在真正接近预算（>=95%）时才拒绝
+        if context == "review_high_risk":
+            used = self.usage_tracker.get(driver_id, 0)
+            if used < self.base_per_driver * 0.95:
+                return True
+            return False
+
         strategy = self.suggest_strategy(driver_id, remaining_steps)
 
         if strategy == "FULL_LLM":
@@ -2331,6 +2691,9 @@ class ModelDecisionService:
         self.coordination_layer = MultiDriverCoordinationLayer()
         # 已注册到 token_optimizer / coordination_layer 的 driver 集合
         self._registered_drivers: set[str] = set()
+        # Task #4: 战略规划器 + 决策审核员
+        self._strategic_planner = StrategicPlanner(self._api)
+        self._reviewer = DecisionReviewer(self._api)
 
     def _get_state(self, driver_id: str) -> StateTracker:
         if driver_id not in self._state_tracker:
@@ -2425,6 +2788,177 @@ class ModelDecisionService:
 
         return False  # 未找到 cargo 信息时拒绝（安全优先）
 
+    def _validate_take_order_constraints(
+        self,
+        cargo_id: str,
+        items: list[dict],
+        status: dict,
+        constraints: list[dict],
+        state: "StateTracker",
+    ) -> tuple[bool, str]:
+        """综合 take_order 硬校验。返回 (通过, 原因)。
+
+        覆盖检查：
+        1. cargo 在可见 items 中
+        2. horizon 内可完成
+        3. 卸货点不违反 spatial_restrict
+        4. 装卸距离不违反 max_haul_distance
+        5. 赴装货点不违反 max_deadhead_distance
+        6. 执行区间不穿过 time_restriction
+        7. daily_home_deadline：完单后能回家
+        8. scheduled_event：不跨过事件时间窗
+        9. monthly_visit：完单后能到达到访点
+        """
+        current_min = int(status.get("simulation_progress_minutes", 0))
+        horizon = _get_horizon_minutes(status)
+        cur_lat = float(status.get("current_lat", 0))
+        cur_lng = float(status.get("current_lng", 0))
+
+        # 找到 cargo
+        found_item = None
+        for item in items:
+            cargo = item.get("cargo", {})
+            if str(cargo.get("cargo_id", "")) == str(cargo_id):
+                found_item = item
+                break
+        if found_item is None:
+            return False, "cargo_not_in_visible_items"
+
+        cargo = found_item.get("cargo", {})
+        distance_km = float(found_item.get("distance_km", 0))
+        cost_time = int(cargo.get("cost_time_minutes", 0))
+        load_time = cargo.get("load_time")
+        start = cargo.get("start", {})
+        end = cargo.get("end", {})
+        start_lat = float(start.get("lat", 0))
+        start_lng = float(start.get("lng", 0))
+        end_lat = float(end.get("lat", 0))
+        end_lng = float(end.get("lng", 0))
+        haul_km = haversine(start_lat, start_lng, end_lat, end_lng)
+
+        deadhead_min = _distance_to_minutes(distance_km)
+        wait_for_load = 0
+        if load_time and isinstance(load_time, list) and len(load_time) == 2:
+            try:
+                window_start = _wall_to_sim_minutes(str(load_time[0]).strip())
+                arrival = current_min + deadhead_min
+                wait_for_load = max(0, window_start - arrival)
+            except Exception:
+                pass
+        total_time = deadhead_min + wait_for_load + cost_time
+        finish_min = current_min + total_time
+
+        # 1. horizon 内可完成
+        if finish_min > horizon:
+            return False, "exceeds_horizon"
+
+        # 2. spatial_restrict：卸货点不能出 bounding_box / 进禁入圆
+        for c in constraints:
+            if c.get("type") != "spatial_restrict":
+                continue
+            p = c.get("params", {})
+            if p.get("type") == "bounding_box":
+                bb = p.get("bounding_box", {})
+                if not PreferenceEngine._in_bounding_box(end_lat, end_lng, bb):
+                    return False, "destination_out_of_allowed_area"
+            elif p.get("type") == "forbidden_circle":
+                cx = float(p.get("center_lat", 0))
+                cy = float(p.get("center_lng", 0))
+                r = float(p.get("radius_km", 20))
+                if haversine(end_lat, end_lng, cx, cy) < r:
+                    return False, "destination_in_forbidden_zone"
+
+        # 3. max_haul_distance
+        for c in constraints:
+            if c.get("type") != "max_haul_distance":
+                continue
+            max_km = float(c.get("params", {}).get("max_km", 9999))
+            if haul_km > max_km:
+                return False, "haul_distance_exceeded"
+
+        # 4. max_deadhead_distance
+        for c in constraints:
+            if c.get("type") != "max_deadhead_distance":
+                continue
+            max_km = float(c.get("params", {}).get("max_deadhead_km", 9999))
+            if distance_km > max_km:
+                return False, "deadhead_distance_exceeded"
+
+        # 5. time_restriction：执行区间不能穿过禁止时段
+        if self._violates_time_restriction(current_min, finish_min, constraints):
+            return False, "violates_time_restriction"
+
+        # 6. daily_home_deadline：完单后必须能回家
+        for c in constraints:
+            if c.get("type") != "daily_home_deadline":
+                continue
+            p = c.get("params", {})
+            home_lat = p.get("home_lat")
+            home_lng = p.get("home_lng")
+            if home_lat is None or home_lng is None:
+                continue
+            try:
+                deadline_hour = int(p.get("deadline_hour", 23))
+            except (ValueError, TypeError):
+                deadline_hour = 23
+            day_index = current_min // 1440
+            today_deadline = day_index * 1440 + deadline_hour * 60
+            # 如果完单已经超过今天 deadline，检查明天
+            if finish_min > today_deadline:
+                today_deadline += 1440
+            travel_home_min = _distance_to_minutes(
+                haversine(end_lat, end_lng, float(home_lat), float(home_lng))
+            )
+            if finish_min + travel_home_min > today_deadline:
+                return False, "cannot_return_home_before_deadline"
+
+        # 7. scheduled_event：不能跨过事件时间窗
+        for c in constraints:
+            if c.get("type") != "scheduled_event":
+                continue
+            p = c.get("params", {})
+            pickup_min = _to_int_or_zero(p.get("pickup_min"))
+            home_deadline = _to_int_or_zero(p.get("home_deadline_min"))
+            release_min = _to_int_or_zero(p.get("release_min"))
+            event_lat = p.get("pickup_lat")
+            event_lng = p.get("pickup_lng")
+            if event_lat is None or event_lng is None:
+                continue
+            # 如果接单会跨过 pickup_min，且终点离事件点远，拒绝
+            if pickup_min > 0 and finish_min > pickup_min:
+                travel_to_event = _distance_to_minutes(
+                    haversine(end_lat, end_lng, float(event_lat), float(event_lng))
+                )
+                if finish_min + travel_to_event > pickup_min + 120:
+                    return False, "order_crosses_event_pickup_window"
+            # 如果接单会跨过 home_deadline，且终点离家远
+            home_lat_c = p.get("home_lat")
+            home_lng_c = p.get("home_lng")
+            if home_deadline > 0 and finish_min > home_deadline and home_lat_c and home_lng_c:
+                travel_home = _distance_to_minutes(
+                    haversine(end_lat, end_lng, float(home_lat_c), float(home_lng_c))
+                )
+                if finish_min + travel_home > home_deadline:
+                    return False, "order_crosses_event_home_deadline"
+
+        # 8. monthly_visit：完单后能到达到访点（当天内）
+        for c in constraints:
+            if c.get("type") != "monthly_visit_requirement":
+                continue
+            p = c.get("params", {})
+            visit_lat = p.get("target_lat")
+            visit_lng = p.get("target_lng")
+            if visit_lat is None or visit_lng is None:
+                continue
+            travel_to_visit = _distance_to_minutes(
+                haversine(end_lat, end_lng, float(visit_lat), float(visit_lng))
+            )
+            day_end = ((current_min // 1440) + 1) * 1440
+            if finish_min + travel_to_visit > day_end:
+                return False, "cannot_reach_visit_point_today"
+
+        return True, ""
+
     def _decide_impl(self, driver_id: str) -> dict:
         # 1. 获取状态
         status = self._api.get_driver_status(driver_id)
@@ -2475,6 +3009,59 @@ class ModelDecisionService:
             self.coordination_layer.register_driver_profile(driver_id, pref_text_for_register)
             self._registered_drivers.add(driver_id)
 
+        # 3.7（Task #4）首次生成战略计划
+        if state.strategic_plan is None:
+            _prefs_text = ""
+            if preferences:
+                _prefs_text = " | ".join(
+                    p.get("content", "") if isinstance(p, dict) else str(p)
+                    for p in preferences
+                    if (p.get("content") if isinstance(p, dict) else p)
+                )
+            try:
+                plan = self._strategic_planner.generate_plan(
+                    driver_id, _prefs_text, constraints, status,
+                    horizon_minutes=horizon,
+                )
+                state.set_strategic_plan(plan)
+                if state.monthly_planner is not None:
+                    state.monthly_planner.integrate_strategic_plan(plan)
+                self._logger.info(
+                    "战略计划已生成 driver=%s must_do=%d risk_windows=%d",
+                    driver_id,
+                    len(state.open_tasks),
+                    len(state.risk_register),
+                )
+            except Exception as e:
+                self._logger.warning("生成战略计划失败 driver=%s: %s", driver_id, e)
+
+        # 3.8（Task #4）刷新任务进度
+        try:
+            _hist_resp = self._api.query_decision_history(driver_id, -1) or {}
+            if isinstance(_hist_resp, dict):
+                _history_records = _hist_resp.get("records", []) or []
+            else:
+                _history_records = list(_hist_resp) if _hist_resp else []
+            state.update_task_progress(current_min, _history_records)
+        except Exception as e:
+            self._logger.warning("刷新任务进度失败 driver=%s: %s", driver_id, e)
+
+        # 3.9（Task #4）紧急战略任务处理
+        _urgent_tasks = state.has_urgent_tasks(current_min)
+        if _urgent_tasks:
+            _urgent_decision = self._handle_urgent_tasks(
+                _urgent_tasks, status, state, constraints
+            )
+            if _urgent_decision:
+                _validated = self._validate_action(_urgent_decision, status, constraints)
+                if _validated:
+                    self._logger.info(
+                        "紧急战略任务触发 driver=%s action=%s",
+                        driver_id, _validated.get("action")
+                    )
+                    self._update_state_after_decision(state, _validated, current_min)
+                    return _validated
+
         # 4. 规则层快速路径（先不查货源的规则）
         rule_decision = self._rule_layer.evaluate(status, state, constraints, None)
         if rule_decision is not None:
@@ -2501,6 +3088,45 @@ class ModelDecisionService:
 
         # 5.5 记录货源频率统计（Task #2）
         state.record_cargo_seen(current_min, len(items))
+
+        # 5.55 熟货优先检查（Task #5）：若有 mandatory_cargo 任务且目标货源已出现，立即接单
+        if state.open_tasks:
+            for _task in state.open_tasks:
+                if _task.get("type") == "mandatory_cargo":
+                    _target_cargo_id = str(_task.get("target", ""))
+                    if not _target_cargo_id:
+                        continue
+                    # 在可见货源中查找指定货源
+                    for _item in items:
+                        _cargo_info = _item.get("cargo", _item)
+                        if str(_cargo_info.get("cargo_id", "")) == _target_cargo_id:
+                            # 找到指定熟货！立即接单
+                            _mandatory_decision = {
+                                "action": "take_order",
+                                "params": {"cargo_id": _target_cargo_id}
+                            }
+                            _validated = self._validate_action(
+                                _mandatory_decision, status_after_query, constraints
+                            )
+                            _feasible = _validated and self._validate_take_order_feasibility(
+                                _target_cargo_id, items, status_after_query
+                            )
+                            if _feasible:
+                                ok, reason = self._validate_take_order_constraints(
+                                    _target_cargo_id, items, status_after_query, constraints, state)
+                                if not ok:
+                                    self._logger.info(
+                                        "熟货约束校验失败 driver=%s cargo=%s reason=%s",
+                                        driver_id, _target_cargo_id, reason)
+                                    _feasible = False
+                            if _feasible:
+                                self._logger.info(
+                                    "熟货优先触发 driver=%s cargo_id=%s",
+                                    driver_id, _target_cargo_id
+                                )
+                                self._update_state_after_decision(state, _validated, current_min)
+                                return _validated
+                            break
 
         # 5.6 更新未来机会预测器统计（Task #4）
         try:
@@ -2557,6 +3183,13 @@ class ModelDecisionService:
                     if not self._validate_take_order_feasibility(cargo_id, items, status_after_query):
                         self._logger.info("规则层 take_order 可行性校验失败，跳过 driver=%s", driver_id)
                         rule_decision = None
+                    else:
+                        ok, reason = self._validate_take_order_constraints(
+                            cargo_id, items, status_after_query, constraints, state)
+                        if not ok:
+                            self._logger.info("规则层 take_order 约束校验失败 driver=%s cargo=%s reason=%s",
+                                              driver_id, cargo_id, reason)
+                            rule_decision = None
                 if rule_decision is not None:
                     self._logger.info("规则层决策(带货源) driver=%s action=%s", driver_id, rule_decision.get("action"))
                     self._update_state_after_decision(state, rule_decision, current_min)
@@ -2584,6 +3217,21 @@ class ModelDecisionService:
             self._update_state_after_decision(state, decision, current_min)
             return decision
 
+        # 评估决策复杂度（供 reviewer 和 token_optimizer 使用）
+        _decision_complexity = "low"
+        if len(candidates) > 3:
+            _decision_complexity = "medium"
+        if candidates and candidates[0].get("penalty_score", 0) > 0:
+            _decision_complexity = "high"
+        if len(candidates) >= 2 and candidates[0]["score"] - candidates[1]["score"] < 10:
+            _decision_complexity = "high"
+
+        remaining_min = horizon - current_min
+        _remaining_steps = max(1, remaining_min // 60)
+
+        # 同步 StateTracker 的 token 用量到 token_optimizer
+        self.token_optimizer.usage_tracker[driver_id] = state.total_tokens_used
+
         # 9. 快速接单路径：如果最优候选评分远超第二，且无违规，直接接单
         if (len(candidates) >= 1 and
                 candidates[0]["score"] > 0 and
@@ -2593,51 +3241,79 @@ class ModelDecisionService:
                 # Token 预算紧张时直接用启发式结果
                 if state.is_token_budget_exceeded():
                     decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
-                    if not self._validate_take_order_feasibility(candidates[0]["cargo_id"], items, status_after_query):
+                    _cid = candidates[0]["cargo_id"]
+                    if not self._validate_take_order_feasibility(_cid, items, status_after_query):
                         decision = {"action": "wait", "params": {"duration_minutes": 30}}
+                    else:
+                        ok, reason = self._validate_take_order_constraints(
+                            _cid, items, status_after_query, constraints, state)
+                        if not ok:
+                            self._logger.info("快速接单约束校验失败 driver=%s cargo=%s reason=%s",
+                                              driver_id, _cid, reason)
+                            decision = {"action": "wait", "params": {"duration_minutes": 30}}
+                    # 快速路径也要经过 reviewer（遵守 95% 阈值）
+                    decision = self._maybe_review_decision(
+                        decision, candidates, state, status_after_query,
+                        constraints, current_min, driver_id,
+                        _decision_complexity, _remaining_steps,
+                    )
                     self._logger.info("快速接单(token降级) driver=%s cargo=%s",
-                                      driver_id, candidates[0]["cargo_id"])
+                                      driver_id, decision.get("params", {}).get("cargo_id", ""))
                     self._update_state_after_decision(state, decision, current_min, candidates)
                     return decision
 
         # 10. Token 预算降级：超阈值时不调 LLM
         if state.is_token_budget_exceeded():
             if candidates and candidates[0]["score"] > 0 and candidates[0]["penalty_score"] == 0:
-                if self._validate_take_order_feasibility(candidates[0]["cargo_id"], items, status_after_query):
-                    decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
+                _cid = candidates[0]["cargo_id"]
+                if self._validate_take_order_feasibility(_cid, items, status_after_query):
+                    ok, reason = self._validate_take_order_constraints(
+                        _cid, items, status_after_query, constraints, state)
+                    if ok:
+                        decision = {"action": "take_order", "params": {"cargo_id": _cid}}
+                    else:
+                        self._logger.info("token降级约束校验失败 driver=%s cargo=%s reason=%s",
+                                          driver_id, _cid, reason)
+                        decision = {"action": "wait", "params": {"duration_minutes": 30}}
                 else:
                     decision = {"action": "wait", "params": {"duration_minutes": 30}}
             else:
                 decision = {"action": "wait", "params": {"duration_minutes": 60}}
+            # token降级路径也要经过 reviewer（遵守 95% 阈值）
+            decision = self._maybe_review_decision(
+                decision, candidates, state, status_after_query,
+                constraints, current_min, driver_id,
+                _decision_complexity, _remaining_steps,
+            )
             self._update_state_after_decision(state, decision, current_min, candidates)
             return decision
 
         # 10.5 Token预算智能分配检查（Task #6）
-        # 评估决策复杂度
-        _decision_complexity = "low"
-        if len(candidates) > 3:
-            _decision_complexity = "medium"
-        if candidates and candidates[0].get("penalty_score", 0) > 0:
-            _decision_complexity = "high"
-        if len(candidates) >= 2 and candidates[0]["score"] - candidates[1]["score"] < 10:
-            _decision_complexity = "high"  # 候选接近，需LLM精细决策
-
-        # 估算剩余决策步数
-        remaining_min = horizon - current_min
-        _remaining_steps = max(1, remaining_min // 60)  # 粗估每60分钟一步
-
-        # 同步 StateTracker 的 token 用量到 token_optimizer
-        self.token_optimizer.usage_tracker[driver_id] = state.total_tokens_used
-
         if not self.token_optimizer.should_use_llm(driver_id, _decision_complexity, _remaining_steps):
             # Token预算建议不使用LLM，直接用启发式结果
             if candidates and candidates[0]["score"] > 0 and candidates[0]["penalty_score"] == 0:
-                if self._validate_take_order_feasibility(candidates[0]["cargo_id"], items, status_after_query):
-                    decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
+                _cid = candidates[0]["cargo_id"]
+                if self._validate_take_order_feasibility(_cid, items, status_after_query):
+                    ok, reason = self._validate_take_order_constraints(
+                        _cid, items, status_after_query, constraints, state)
+                    if ok:
+                        decision = {"action": "take_order", "params": {"cargo_id": _cid}}
+                    else:
+                        self._logger.info("token优化约束校验失败 driver=%s cargo=%s reason=%s",
+                                          driver_id, _cid, reason)
+                        decision = {"action": "wait", "params": {"duration_minutes": 30}}
                 else:
                     decision = {"action": "wait", "params": {"duration_minutes": 30}}
             else:
                 decision = {"action": "wait", "params": {"duration_minutes": 60}}
+
+            # 统一经过 reviewer 审核（遵守 95% 阈值）
+            decision = self._maybe_review_decision(
+                decision, candidates, state, status_after_query,
+                constraints, current_min, driver_id,
+                _decision_complexity, _remaining_steps,
+            )
+
             self._logger.info("Token智能分配跳过LLM driver=%s complexity=%s strategy=%s",
                               driver_id, _decision_complexity,
                               self.token_optimizer.suggest_strategy(driver_id, _remaining_steps))
@@ -2649,6 +3325,63 @@ class ModelDecisionService:
                 decision.get("action", "")
             )
             return decision
+
+        # 10.6（Task #4）DecisionReviewer 审核启发式提议
+        try:
+            _heuristic_proposal = {
+                "action": "take_order",
+                "params": {"cargo_id": candidates[0]["cargo_id"]},
+            }
+            if self._reviewer.should_review(state, candidates, _heuristic_proposal, current_min):
+                # 高风险审核：受 token_optimizer 控制（接近预算时跳过）
+                if self.token_optimizer.should_use_llm(
+                    driver_id, _decision_complexity, _remaining_steps,
+                    context="review_high_risk",
+                ):
+                    _review_context = self._build_review_context(
+                        state, status_after_query, constraints,
+                        _heuristic_proposal, candidates,
+                    )
+                    _review_result = self._reviewer.review(_review_context)
+                    state.last_llm_review_minute = current_min
+
+                    if not _review_result.get("approve", True):
+                        _reviewer_decision = self._convert_review_to_decision(_review_result)
+                        _validated = self._validate_reviewer_decision(
+                            _reviewer_decision, candidates, status_after_query, constraints
+                        )
+                        if _validated:
+                            # reviewer 建议 wait 最长 60 分钟，跟踪连续 wait
+                            if _validated.get("action") == "wait":
+                                dur = int(_validated.get("params", {}).get("duration_minutes", 30))
+                                if dur > 60:
+                                    _validated["params"]["duration_minutes"] = 60
+                                state.consecutive_review_waits += 1
+                            else:
+                                state.consecutive_review_waits = 0
+                            state.last_review_reason = _review_result.get("reason", "")
+                            self._logger.info(
+                                "Reviewer 否决启发式 driver=%s action=%s reason=%s consecutive_waits=%d",
+                                driver_id, _validated.get("action"),
+                                _review_result.get("reason", ""),
+                                state.consecutive_review_waits,
+                            )
+                            self._update_state_after_decision(
+                                state, _validated, current_min, candidates
+                            )
+                            self.coordination_layer.record_decision(
+                                driver_id,
+                                _validated.get("params", {}).get("cargo_id", ""),
+                                _validated.get("action", ""),
+                            )
+                            return _validated
+                        else:
+                            self._logger.info(
+                                "Reviewer 建议不合法，回退到 LLM/启发式 driver=%s",
+                                driver_id,
+                            )
+        except Exception as e:
+            self._logger.warning("Reviewer 审核异常 driver=%s: %s", driver_id, e)
 
         # 11. LLM 层决策
         decision = self._llm_layer.decide(
@@ -2666,11 +3399,18 @@ class ModelDecisionService:
         if decision is None:
             self._logger.info("LLM决策被安全闸拦截，fallback wait driver=%s", driver_id)
             decision = {"action": "wait", "params": {"duration_minutes": 30}}
-        # 统一接单 horizon 校验
+        # 统一接单 horizon + 约束校验
         if decision.get("action") == "take_order":
             cargo_id = decision.get("params", {}).get("cargo_id", "")
             if not self._validate_take_order_feasibility(cargo_id, items, status_after_query):
                 decision = {"action": "wait", "params": {"duration_minutes": 30}}
+            else:
+                ok, reason = self._validate_take_order_constraints(
+                    cargo_id, items, status_after_query, constraints, state)
+                if not ok:
+                    self._logger.info("LLM take_order 约束校验失败 driver=%s cargo=%s reason=%s",
+                                      driver_id, cargo_id, reason)
+                    decision = {"action": "wait", "params": {"duration_minutes": 30}}
         self._update_state_after_decision(state, decision, current_min, candidates)
 
         # Task #7: 记录决策到协调层
@@ -2680,6 +3420,294 @@ class ModelDecisionService:
             decision.get("action", "")
         )
 
+        return decision
+
+    def _handle_urgent_tasks(self, urgent_tasks: list[dict], status: dict,
+                             state: "StateTracker", constraints: list[dict]) -> dict | None:
+        """处理紧急战略任务，生成优先动作"""
+        current_min = int(status.get("simulation_progress_minutes", 0))
+        cur_lat = float(status.get("current_lat", 0))
+        cur_lng = float(status.get("current_lng", 0))
+        day_index = current_min // 1440 + 1
+        minute_in_day = current_min % 1440  # 当天已过的分钟数
+
+        for task in sorted(urgent_tasks, key=lambda t: t.get("priority", 99)):
+            task_type = task.get("type", "")
+
+            if task_type == "mandatory_cargo":
+                # D009场景：指定熟货必接
+                # 如果快到deadline了，我们不能主动接（需要在货源出现时接），
+                # 但可以让司机等待在当前位置，不要跑远
+                # 返回短时等待，后续主流程中若看到指定货源会优先接
+                target_cargo = str(task.get("target", ""))
+                if target_cargo:
+                    # 短时等待策略：不要离开，等熟货出现
+                    return {
+                        "action": "wait",
+                        "params": {"duration_minutes": 30}
+                    }
+
+            elif task_type == "monthly_visit":
+                # D010场景：到访指定点
+                # 如果deadline快到了，主动reposition到目标
+                target_str = task.get("target", "")
+                if "lat=" in target_str and "lng=" in target_str:
+                    try:
+                        parts = target_str.split(",")
+                        t_lat = float(parts[0].split("=")[1])
+                        t_lng = float(parts[1].split("=")[1])
+                        # 检查是否已经在目标附近（5km≈0.05度）
+                        if (abs(cur_lat - t_lat) < 0.05 and abs(cur_lng - t_lng) < 0.05):
+                            # 已到达，等待一段时间确认到访
+                            return {
+                                "action": "wait",
+                                "params": {"duration_minutes": 30}
+                            }
+                        else:
+                            # 需要移动到目标点
+                            return {
+                                "action": "reposition",
+                                "params": {
+                                    "latitude": t_lat,
+                                    "longitude": t_lng,
+                                }
+                            }
+                    except (ValueError, IndexError):
+                        pass
+
+            elif task_type == "daily_home_deadline":
+                # D009场景：每日回家deadline
+                # 检查是否快到今天的deadline了
+                deadline_hour = 23  # 默认23点
+                target_info = task.get("target", "")
+                if "hour=" in target_info:
+                    try:
+                        deadline_hour = int(target_info.split("hour=")[1].split(",")[0])
+                    except (ValueError, IndexError):
+                        pass
+
+                deadline_minute_today = deadline_hour * 60
+                time_left = deadline_minute_today - minute_in_day
+
+                if 0 < time_left < 180:  # 距回家deadline不到3小时
+                    # 尝试从 home_or_visit_plan 获取家的坐标
+                    home_lat, home_lng = None, None
+                    if state.strategic_plan:
+                        for hvp in state.strategic_plan.get("home_or_visit_plan", []):
+                            if hvp.get("day") == 0 or hvp.get("day") == day_index:
+                                home_lat = hvp.get("target_lat")
+                                home_lng = hvp.get("target_lng")
+                                break
+                    # 也尝试从约束中获取
+                    if home_lat is None:
+                        for c in constraints:
+                            if c.get("type") == "daily_home_deadline":
+                                params = c.get("params", {})
+                                home_lat = params.get("home_lat") or params.get("latitude")
+                                home_lng = params.get("home_lng") or params.get("longitude")
+                                if home_lat:
+                                    break
+
+                    if home_lat is not None and home_lng is not None:
+                        try:
+                            home_lat = float(home_lat)
+                            home_lng = float(home_lng)
+                            # 如果已经在家附近，等待
+                            if (abs(cur_lat - home_lat) < 0.02 and
+                                    abs(cur_lng - home_lng) < 0.02):
+                                return {
+                                    "action": "wait",
+                                    "params": {"duration_minutes": 30}
+                                }
+                            else:
+                                return {
+                                    "action": "reposition",
+                                    "params": {
+                                        "latitude": home_lat,
+                                        "longitude": home_lng,
+                                    }
+                                }
+                        except (ValueError, TypeError):
+                            pass
+
+        return None
+
+    def _build_review_context(self, state: "StateTracker", status: dict,
+                              constraints: list[dict], heuristic_proposal: dict,
+                              candidates: list[dict]) -> dict:
+        """构建 DecisionReviewer 的审核上下文"""
+        current_min = int(status.get("simulation_progress_minutes", 0))
+        day_index = current_min // 1440 + 1
+
+        context = {
+            "current_status": {
+                "latitude": status.get("current_lat"),
+                "longitude": status.get("current_lng"),
+                "current_minute": current_min,
+                "day": day_index,
+                "total_income": state.total_income,
+                "total_orders": state.total_orders,
+                "total_deadhead_km": state.total_deadhead_km,
+            },
+            "strategic_plan_summary": {
+                "must_do_tasks_remaining": len(state.open_tasks),
+                "tasks": state.open_tasks[:5],
+                "daily_intent": state.get_daily_intent(day_index),
+            },
+            "task_progress": {
+                "open": len(state.open_tasks),
+                "completed": len(state.completed_tasks),
+                "idle_days_done": state.completed_idle_days,
+            },
+            "constraints_summary": [
+                {"type": c.get("type"), "severity": c.get("severity")}
+                for c in constraints[:10]
+            ],
+            "heuristic_proposal": heuristic_proposal,
+            "top_candidates": [
+                {
+                    "cargo_id": c.get("cargo_id") or c.get("cargo", {}).get("cargo_id"),
+                    "score": c.get("score", 0),
+                    "net_profit": c.get("net_profit") or c.get("profit", 0),
+                    "deadhead_km": c.get("deadhead_km") or c.get("distance_km", 0),
+                    "cost_time_minutes": c.get("cost_time_minutes")
+                        or c.get("cargo", {}).get("cost_time_minutes", 0),
+                }
+                for c in candidates[:5]
+            ],
+        }
+        return context
+
+    def _convert_review_to_decision(self, review_result: dict) -> dict:
+        """将 reviewer 的审核结果转换为标准决策格式"""
+        action = review_result.get("action", "wait")
+        params: dict = {}
+
+        if action == "take_order":
+            cargo_id = review_result.get("cargo_id")
+            if cargo_id:
+                params["cargo_id"] = str(cargo_id)
+            else:
+                action = "wait"
+                params["duration_minutes"] = 30
+        elif action == "reposition":
+            lat = review_result.get("latitude")
+            lng = review_result.get("longitude")
+            if lat is not None and lng is not None:
+                params["latitude"] = float(lat)
+                params["longitude"] = float(lng)
+            else:
+                action = "wait"
+                params["duration_minutes"] = 30
+        else:
+            action = "wait"
+            params["duration_minutes"] = int(review_result.get("duration_minutes") or 30)
+
+        return {"action": action, "params": params}
+
+    def _validate_reviewer_decision(self, decision: dict, candidates: list[dict],
+                                    status: dict, constraints: list[dict]) -> dict | None:
+        """校验 reviewer 产生的动作，与 _validate_action 同等标准"""
+        validated = self._validate_action(decision, status, constraints)
+        if validated and validated.get("action") == "take_order":
+            cargo_id = str(validated.get("params", {}).get("cargo_id", ""))
+            valid_ids = set()
+            for c in candidates:
+                cid = c.get("cargo_id") or c.get("cargo", {}).get("cargo_id", "")
+                if cid:
+                    valid_ids.add(str(cid))
+            if cargo_id not in valid_ids:
+                return None  # cargo_id 不在可见候选中，安全拒绝
+        return validated
+
+    def _try_reviewer_override(self, decision: dict, candidates: list[dict],
+                               state: StateTracker, status: dict,
+                               constraints: list[dict], current_min: int,
+                               driver_id: str) -> dict:
+        """尝试用 DecisionReviewer 审核决策，返回（可能被否决后的）最终决策。
+        用于快速接单/token降级等路径。"""
+        try:
+            _proposal = {
+                "action": decision.get("action"),
+                "params": decision.get("params", {}),
+            }
+            if self._reviewer.should_review(state, candidates, _proposal, current_min):
+                # 快速/token降级路径：不额外检查 token 预算，直接审核
+                _ctx = self._build_review_context(
+                    state, status, constraints, _proposal, candidates,
+                )
+                _result = self._reviewer.review(_ctx)
+                state.last_llm_review_minute = current_min
+                if not _result.get("approve", True):
+                    _reviewer_dec = self._convert_review_to_decision(_result)
+                    _validated = self._validate_reviewer_decision(
+                        _reviewer_dec, candidates, status, constraints,
+                    )
+                    if _validated:
+                        self._logger.info(
+                            "Reviewer 否决(快速路径) driver=%s action=%s reason=%s",
+                            driver_id, _validated.get("action"),
+                            _result.get("reason", ""),
+                        )
+                        return _validated
+        except Exception as e:
+            self._logger.warning("Reviewer(快速路径)异常 driver=%s: %s", driver_id, e)
+        return decision
+
+    def _maybe_review_decision(self, decision: dict, candidates: list[dict],
+                               state: StateTracker, status: dict,
+                               constraints: list[dict], current_min: int,
+                               driver_id: str,
+                               decision_complexity: str = "low",
+                               remaining_steps: int = 100) -> dict:
+        """统一的 reviewer 审核入口，所有决策路径都应经过此方法。
+        遵守 token_optimizer 的 95% 阈值：接近预算时仍允许审核。
+        连续 wait >= 3 次时暂停审核 180 分钟。"""
+        try:
+            _proposal = {
+                "action": decision.get("action"),
+                "params": decision.get("params", {}),
+            }
+            if not self._reviewer.should_review(state, candidates, _proposal, current_min):
+                return decision
+            # 检查 token 预算：review_high_risk 在 <95% 时允许
+            if not self.token_optimizer.should_use_llm(
+                driver_id, decision_complexity, remaining_steps,
+                context="review_high_risk",
+            ):
+                return decision
+            _ctx = self._build_review_context(
+                state, status, constraints, _proposal, candidates,
+            )
+            _result = self._reviewer.review(_ctx)
+            state.last_llm_review_minute = current_min
+            if not _result.get("approve", True):
+                _reviewer_dec = self._convert_review_to_decision(_result)
+                _validated = self._validate_reviewer_decision(
+                    _reviewer_dec, candidates, status, constraints,
+                )
+                if _validated:
+                    # reviewer 建议 wait 最长 60 分钟
+                    if _validated.get("action") == "wait":
+                        dur = int(_validated.get("params", {}).get("duration_minutes", 30))
+                        if dur > 60:
+                            _validated["params"]["duration_minutes"] = 60
+                        state.consecutive_review_waits += 1
+                    else:
+                        state.consecutive_review_waits = 0
+                    state.last_review_reason = _result.get("reason", "")
+                    self._logger.info(
+                        "Reviewer 否决 driver=%s action=%s reason=%s consecutive_waits=%d",
+                        driver_id, _validated.get("action"),
+                        _result.get("reason", ""),
+                        state.consecutive_review_waits,
+                    )
+                    return _validated
+            else:
+                # reviewer 批准，重置连续 wait 计数
+                state.consecutive_review_waits = 0
+        except Exception as e:
+            self._logger.warning("DecisionReviewer 异常 driver=%s: %s", driver_id, e)
         return decision
 
     def _update_state_after_decision(self, state: StateTracker, decision: dict,

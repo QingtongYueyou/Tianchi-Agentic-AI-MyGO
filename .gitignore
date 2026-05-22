@@ -1,3 +1,22 @@
 config.json
 demo/server/data/cargo_dataset.jsonl
 .venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+
+# Local tool config
+.claude/settings.local.json
+.qoder/
+
+# Simulation results (generated output, not source)
+demo/results/actions_*.jsonl
+demo/results/logs/
+demo/results/history/
+demo/results/monthly_income_*.json
+demo/results/run_summary_*.json
