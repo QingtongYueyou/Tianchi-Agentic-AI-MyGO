@@ -29,12 +29,16 @@ _logger = logging.getLogger("agent.hybrid_decision")
 # ─────────────────────────────────────────────────────────────────────────────
 def haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """大圆距离（km）"""
-    R = 6371.0
-    p1, l1, p2, l2 = map(math.radians, (lat1, lng1, lat2, lng2))
-    dp, dl = p2 - p1, l2 - l1
-    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    radius_km = 6371.0
+    p1 = math.radians(lat1)
+    l1 = math.radians(lng1)
+    p2 = math.radians(lat2)
+    l2 = math.radians(lng2)
+    dp = p2 - p1
+    dl = l2 - l1
+    h = math.sin(dp * 0.5) ** 2 + math.cos(p1) * math.cos(p2) * (math.sin(dl * 0.5) ** 2)
     h = min(1.0, max(0.0, h))
-    return 2 * R * math.asin(math.sqrt(h))
+    return 2.0 * radius_km * math.asin(math.sqrt(h))
 
 
 def _distance_to_minutes(distance_km: float, speed: float = _SPEED_KM_H) -> int:
@@ -209,7 +213,7 @@ class StateTracker:
             return
         current_day_idx = _get_day_index(self.last_action_end_min)
         idle_count = 0
-        for d in range(current_day_idx):
+        for d in range(current_day_idx + 1):
             if d not in self.active_days:
                 idle_count += 1
         self.completed_idle_days = idle_count
@@ -564,7 +568,7 @@ class TimeWindowOptimizer:
 
             if load_time and isinstance(load_time, list) and len(load_time) == 2:
                 # 计算到达时间（按60km/h估算）
-                travel_minutes = distance_km  # 约1分钟/km
+                travel_minutes = _distance_to_minutes(distance_km)
                 arrival_min = current_min + travel_minutes
 
                 # 解析时间窗
@@ -636,7 +640,7 @@ class TimeWindowOptimizer:
         if window_end is None:
             return "LOW"
 
-        travel_minutes = distance_km  # 约1分钟/km
+        travel_minutes = _distance_to_minutes(distance_km)
         arrival_min = current_min + travel_minutes
         buffer = window_end - arrival_min
 
@@ -769,8 +773,8 @@ class ProactiveRepositionLayer:
                 if isinstance(grid_key, tuple) and len(grid_key) == 2:
                     raw_lat, raw_lng = grid_key
                     # 还原成实际经纬度的 0.1 度精度
-                    lat = raw_lat / 10.0 if abs(raw_lat) > 90 else float(raw_lat)
-                    lng = raw_lng / 10.0 if abs(raw_lng) > 180 else float(raw_lng)
+                    lat = raw_lat / 10.0
+                    lng = raw_lng / 10.0
                 else:
                     continue
             except Exception:
@@ -874,6 +878,8 @@ class RuleLayer:
             return idle_result
 
         # 1. 月末收官：剩余不足 60 分钟无法完成任何订单
+        if remaining <= 0:
+            return {"action": "wait", "params": {"duration_minutes": 0}}
         if remaining <= 60:
             wait_min = max(1, remaining)
             return self._wait(wait_min)
@@ -1203,7 +1209,7 @@ class HeuristicLayer:
             # 新综合评分公式（Task #2）
             score = (
                 time_efficiency * 60 * time_phase_multiplier
-                - penalty_score * 2.0 * (1 - preference_impact)
+                - penalty_score * 2.0 * (1 + preference_impact)
                 + cluster_value
                 + net_profit * 0.15
                 + scarcity_factor

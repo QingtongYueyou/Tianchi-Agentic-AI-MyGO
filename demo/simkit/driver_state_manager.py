@@ -174,13 +174,17 @@ class DriverStateManager:
             raise ValueError(f"cargo_id 已被占用: {cargo_id}")
 
         self._taken_cargo_ids.add(cargo_id)
-        self._completed_orders_by_driver[driver_id] = self._completed_orders_by_driver.get(driver_id, 0) + 1
-        self.advance_progress(driver_id, duration_minutes)
-        self._current_order_by_driver[driver_id] = None
+        try:
+            self._completed_orders_by_driver[driver_id] = self._completed_orders_by_driver.get(driver_id, 0) + 1
+            self.advance_progress(driver_id, duration_minutes)
+            self._current_order_by_driver[driver_id] = None
 
-        profile = self._drivers[driver_id]
-        profile["current_lat"] = float(end_latitude)
-        profile["current_lng"] = float(end_longitude)
+            profile = self._drivers[driver_id]
+            profile["current_lat"] = float(end_latitude)
+            profile["current_lng"] = float(end_longitude)
+        except Exception:
+            self._taken_cargo_ids.discard(cargo_id)
+            raise
 
         return {
             "accepted": True,
