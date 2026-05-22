@@ -20,6 +20,9 @@ _SPEED_KM_H = 60.0
 _COST_PER_KM_DEFAULT = 1.5
 _TOKEN_BUDGET = 1_000_000  # 月度 token 预算上限
 _TOKEN_DEGRADE_RATIO = 0.80
+_CHINA_LAT_RANGE = (18.0, 54.0)
+_CHINA_LNG_RANGE = (73.0, 136.0)
+_MAX_SINGLE_REPOSITION_KM = 300.0
 
 _logger = logging.getLogger("agent.hybrid_decision")
 
@@ -247,7 +250,7 @@ class StateTracker:
             return
         current_day_idx = _get_day_index(self.last_action_end_min)
         idle_count = 0
-        for d in range(current_day_idx + 1):
+        for d in range(current_day_idx):  # 不含当天（当天尚未结束，不能确定是否空闲）
             if d not in self.active_days:
                 idle_count += 1
         self.completed_idle_days = idle_count
@@ -338,18 +341,34 @@ class StateTracker:
         self.last_action_end_min = sim_min
 
     def get_max_continuous_rest_today(self, current_min: int) -> int:
-        """获取今天（到当前时刻）的最大连续休息分钟数。"""
+        """获取今天（到当前时刻）的最大连续休息分钟数（合并相邻区间）。"""
         day_idx = _get_day_index(current_min)
         day_start = day_idx * 1440
         day_end = current_min
-        max_rest = 0
+
+        # 收集今天所有 wait 区间并裁剪
+        today_intervals = []
         for s, e in self.wait_intervals:
-            # 计算与今天重叠的部分
             overlap_s = max(s, day_start)
             overlap_e = min(e, day_end)
             if overlap_e > overlap_s:
-                max_rest = max(max_rest, overlap_e - overlap_s)
-        return max_rest
+                today_intervals.append((overlap_s, overlap_e))
+
+        if not today_intervals:
+            return 0
+
+        # 按起始时间排序后合并相邻/重叠区间
+        today_intervals.sort()
+        merged = [today_intervals[0]]
+        for s, e in today_intervals[1:]:
+            prev_s, prev_e = merged[-1]
+            if s <= prev_e:  # 重叠或紧邻
+                merged[-1] = (prev_s, max(prev_e, e))
+            else:
+                merged.append((s, e))
+
+        # 返回最长合并区间
+        return max(e - s for s, e in merged)
 
     def get_orders_today(self, current_min: int) -> int:
         day_idx = _get_day_index(current_min)
@@ -474,7 +493,7 @@ class PreferenceEngine:
         """LLM 结果和确定性解析互补；确定性解析负责关键罚分项兜底。"""
         out: list[dict] = []
         seen: set[tuple[str, str]] = set()
-        for c in list(parsed or []) + list(deterministic or []):
+        for c in list(deterministic or []) + list(parsed or []):
             if not isinstance(c, dict):
                 continue
             ctype = str(c.get("type", "custom"))
@@ -570,7 +589,7 @@ class PreferenceEngine:
                 params["activation_min"] = _wall_to_sim_minutes(start_match.group(1))
             except Exception:
                 pass
-        return {**base, "type": "mandatory_cargo", "params": params}
+        return {**base, "type": "mandatory_cargo", "params": params, "severity": "hard"}
 
     def _parse_family_event(self, content: str, base: dict) -> dict | None:
         if "家事" not in content and "配偶" not in content:
@@ -603,7 +622,7 @@ class PreferenceEngine:
             "release_min": _wall_to_sim_minutes(release_wall),
             "pickup_wait_minutes": 10,
         }
-        return {**base, "type": "scheduled_event", "params": params}
+        return {**base, "type": "scheduled_event", "params": params, "severity": "hard"}
 
     def _parse_daily_home_deadline(self, content: str, base: dict) -> dict | None:
         if "家" not in content or "点前" not in content:
@@ -622,7 +641,7 @@ class PreferenceEngine:
         if night:
             params["forbidden_start_hour"] = int(night.group(1))
             params["forbidden_end_hour"] = int(night.group(2))
-        return {**base, "type": "daily_home_deadline", "params": params}
+        return {**base, "type": "daily_home_deadline", "params": params, "severity": "hard"}
 
     def _parse_monthly_visit_requirement(self, content: str, base: dict) -> dict | None:
         if "不同的自然日到过" not in content and "至少" not in content:
@@ -640,15 +659,18 @@ class PreferenceEngine:
                 "target_lng": coords[0][1],
                 "radius_km": 1.0,
             },
+            "severity": "monthly",
         }
 
     def _parse_banned_categories(self, content: str, base: dict) -> dict | None:
-        if "不接" not in content and "不拉" not in content:
+        if "不接" not in content and "不拉" not in content and "尽量" not in content:
             return None
         cats = re.findall(r"「([^」]+)」", content)
         if not cats:
             return None
-        return {**base, "type": "cargo_category_ban", "params": {"banned_categories": cats}}
+        # 区分硬禁和软偏好
+        severity = "soft" if ("尽量" in content or "不太" in content or "最好" in content) else "hard"
+        return {**base, "type": "cargo_category_ban", "params": {"banned_categories": cats}, "severity": severity}
 
     def _parse_daily_rest(self, content: str, base: dict) -> dict | None:
         if "休息" not in content and "歇" not in content and "停车" not in content:
@@ -657,7 +679,7 @@ class PreferenceEngine:
         if not match:
             return None
         minutes = int(float(match.group(1)) * 60)
-        return {**base, "type": "daily_rest", "params": {"min_continuous_minutes": minutes}}
+        return {**base, "type": "daily_rest", "params": {"min_continuous_minutes": minutes}, "severity": "soft"}
 
     def _parse_day_off(self, content: str, base: dict) -> dict | None:
         if "自然月" not in content and "每月" not in content and "月内" not in content:
@@ -674,7 +696,7 @@ class PreferenceEngine:
             days = self._chinese_number(cn_match.group(1)) if cn_match else 0
         if days <= 0:
             return None
-        return {**base, "type": "day_off_requirement", "params": {"min_days_off": days}}
+        return {**base, "type": "day_off_requirement", "params": {"min_days_off": days}, "severity": "monthly"}
 
     def _parse_time_restriction(self, content: str, base: dict) -> dict | None:
         if "不接单" not in content and "不空" not in content:
@@ -690,6 +712,7 @@ class PreferenceEngine:
                 "end_hour": int(match.group(2)),
                 "forbidden_actions": ["take_order", "reposition"],
             },
+            "severity": "hard",
         }
 
     def _parse_deadhead_cap(self, content: str, base: dict) -> dict | None:
@@ -701,7 +724,7 @@ class PreferenceEngine:
         max_km = float(match.group(1))
         ctype = "mileage_cap" if "月" in content and "空驶" in content else "max_deadhead_distance"
         key = "max_deadhead_km"
-        return {**base, "type": ctype, "params": {key: max_km}}
+        return {**base, "type": ctype, "params": {key: max_km}, "severity": "hard"}
 
     def _parse_haul_cap(self, content: str, base: dict) -> dict | None:
         if "装货点至卸货点" not in content and "装卸距离" not in content:
@@ -709,7 +732,7 @@ class PreferenceEngine:
         match = re.search(r"(?:不超过|≤|小于等于)\s*(\d+(?:\.\d+)?)\s*公里", content)
         if not match:
             return None
-        return {**base, "type": "max_haul_distance", "params": {"max_km": float(match.group(1))}}
+        return {**base, "type": "max_haul_distance", "params": {"max_km": float(match.group(1))}, "severity": "hard"}
 
     def _parse_spatial_restriction(self, content: str, base: dict) -> dict | None:
         if "深圳" in content and "范围" in content:
@@ -728,6 +751,7 @@ class PreferenceEngine:
                             "lng_max": float(lng_match.group(2)),
                         },
                     },
+                    "severity": "hard",
                 }
         if "不得进入" in content and "半径" in content:
             coords = self._extract_coords(content)
@@ -742,6 +766,7 @@ class PreferenceEngine:
                         "center_lng": coords[0][1],
                         "radius_km": float(radius.group(1)),
                     },
+                    "severity": "hard",
                 }
         return None
 
@@ -753,7 +778,7 @@ class PreferenceEngine:
         match = re.search(r"(?:不得超过|不超过|≤)\s*(\d+)\s*单", content)
         if not match:
             return None
-        return {**base, "type": "max_orders_per_day", "params": {"max_orders": int(match.group(1))}}
+        return {**base, "type": "max_orders_per_day", "params": {"max_orders": int(match.group(1))}, "severity": "hard"}
 
     @staticmethod
     def _extract_coords(text: str) -> list[tuple[float, float]]:
@@ -1455,7 +1480,7 @@ class RuleLayer:
 
     def _check_forced_rest(self, current_min: int, state: StateTracker,
                            constraints: list[dict], horizon: int) -> dict | None:
-        """检查今天是否满足了最低连续休息要求。"""
+        """检查今天是否满足了最低连续休息要求，精确补足差额。"""
         for c in constraints:
             if c.get("type") != "daily_rest":
                 continue
@@ -1464,11 +1489,12 @@ class RuleLayer:
             if required_min <= 0:
                 continue
             current_rest = state.get_max_continuous_rest_today(current_min)
-            hour = _get_hour_of_day(current_min)
-            # 如果今天快结束了但还没满足休息要求，强制休息
+            if current_rest >= required_min:
+                continue  # 已满足，无需强制
             remaining_today = 1440 - (current_min % 1440)
-            if current_rest < required_min and remaining_today <= required_min + 60:
-                need = required_min - current_rest
+            # 只在今天剩余时间不够"再接单+补休"时才强制
+            need = required_min - current_rest
+            if remaining_today <= need + 60:
                 remaining_total = horizon - current_min
                 wait_min = max(1, min(need, remaining_today, remaining_total))
                 return self._wait(wait_min)
@@ -1498,40 +1524,32 @@ class RuleLayer:
         return None
 
     def _check_planned_idle_day(self, current_min: int, state: StateTracker, horizon: int) -> dict | None:
-        """检查今日是否为规划的空闲日或是否需要触发补救模式（Task #1）。"""
+        """检查今日是否需要强制空闲（仅月末补救时拦截，其余交给评分层）。"""
         planner = state.monthly_planner
         if planner is None or planner.required_idle_days <= 0:
             return None
 
-        # 当前天数（1-based）
         current_day = _get_day_index(current_min) + 1
+        total_days = max(1, math.ceil(horizon / 1440))
         remaining = horizon - current_min
-        completed_idle = state.get_full_idle_days_count(current_min)
-        remaining_required = max(0, planner.required_idle_days - completed_idle)
-        if remaining_required <= 0:
+
+        # 短期仿真观测模式：horizon_days < required + 2 时不主动停工
+        if total_days < planner.required_idle_days + 2:
             return None
 
-        # 如果今天是规划的空闲日，直接等待到次日0点
-        if planner.is_today_idle_day(current_day):
-            # 计算到次日0点的分钟数
+        # 仅月末强制补救：剩余天数 <= 剩余需求时才拦截
+        remaining_required = max(0, planner.required_idle_days - state.completed_idle_days)
+        remaining_days = total_days - current_day
+        if remaining_required > 0 and remaining_days <= remaining_required:
+            # 月末强制补救 - 今天必须空闲
             minutes_in_day = current_min % 1440
             wait_until_next_day = 1440 - minutes_in_day
             wait_min = max(1, min(wait_until_next_day, remaining))
-            _logger.info("规划空闲日: day=%d, wait=%d min", current_day, wait_min)
+            _logger.info("月末强制补救: day=%d, remaining_required=%d, wait=%d min",
+                         current_day, remaining_required, wait_min)
             return self._wait(wait_min)
 
-        # 只在规划空闲日不足以覆盖剩余需求时，用当前非活跃日补救，避免月末无差别停摆。
-        future_planned = [d for d in planner.get_planned_idle_days() if d >= current_day]
-        current_day_idx = _get_day_index(current_min)
-        can_rescue_today = current_day_idx not in state.active_days
-        if can_rescue_today and len(future_planned) < remaining_required:
-            minutes_in_day = current_min % 1440
-            wait_until_next_day = 1440 - minutes_in_day
-            wait_min = max(1, min(wait_until_next_day, remaining))
-            _logger.info("偏好补救模式: day=%d, completed_idle=%d, remaining_required=%d, wait=%d min",
-                         current_day, completed_idle, remaining_required, wait_min)
-            return self._wait(wait_min)
-
+        # 其余情况交给启发式层通过评分影响决策
         return None
 
     @staticmethod
@@ -1633,8 +1651,16 @@ class HeuristicLayer:
         # 计算月度进度比（Task #2）
         month_progress_ratio = current_min / max(1, horizon)
         time_phase_multiplier = self._get_time_phase_multiplier(month_progress_ratio)
-        banned_categories = self._get_banned_categories(constraints)
+        hard_banned, soft_banned = self._get_banned_categories(constraints)
         monthly_deadhead_cap = self._get_monthly_deadhead_cap(constraints)
+
+        # 月度空闲日评分惩罚（Task #2）：今天是 planner 建议的空闲日时，软惩罚所有候选
+        idle_day_penalty = 0.0
+        if state.monthly_planner and state.monthly_planner.is_today_idle_day(_get_day_index(current_min) + 1):
+            progress = state.monthly_planner.get_progress_report(
+                state.completed_idle_days, _get_day_index(current_min) + 1)
+            if progress["remaining_required"] > 0:
+                idle_day_penalty = 30.0  # 软惩罚，高净利润货仍可突破
 
         scored = []
 
@@ -1653,8 +1679,8 @@ class HeuristicLayer:
             load_time = cargo.get("load_time")
             cargo_name = cargo.get("cargo_name", "")
 
-            # 过滤: 禁接/尽量不拉的品类先剔除，避免用收益抵消硬偏好罚款。
-            if any(b in cargo_name for b in banned_categories):
+            # 过滤: 仅硬禁品类先剔除；软偏好品类留下通过评分惩罚
+            if any(b in cargo_name for b in hard_banned):
                 continue
 
             # 过滤: 装货时间窗已过期
@@ -1695,44 +1721,45 @@ class HeuristicLayer:
                 ctype = c.get("type", "")
                 params = c.get("params", {})
                 p_amount = float(c.get("penalty_amount", 0))
+                severity = c.get("severity", "hard")
 
                 if ctype == "cargo_category_ban":
                     banned = params.get("banned_categories", [])
                     for b in banned:
                         if b in cargo_name:
-                            penalty_score += p_amount
+                            penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
                             break
 
                 elif ctype == "max_deadhead_distance":
                     max_km = float(params.get("max_deadhead_km", 9999))
                     if distance_km > max_km:
-                        penalty_score += p_amount
+                        penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
 
                 elif ctype == "mileage_cap":
                     max_km = float(params.get("max_deadhead_km", 9999))
                     if state.total_deadhead_km + distance_km > max_km:
                         over = state.total_deadhead_km + distance_km - max_km
-                        penalty_score += max(p_amount, over * 10.0)
+                        penalty_score += max(p_amount, over * 10.0) * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
 
                 elif ctype == "max_haul_distance":
                     max_km = float(params.get("max_km", 9999))
                     if haul_km > max_km:
-                        penalty_score += p_amount
+                        penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
 
                 elif ctype == "spatial_restrict":
                     if params.get("type") == "bounding_box":
                         bb = params.get("bounding_box", {})
                         if not PreferenceEngine._in_bounding_box(end_lat, end_lng, bb):
-                            penalty_score += p_amount
+                            penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
                     elif params.get("type") == "forbidden_circle":
                         cx = float(params.get("center_lat", 0))
                         cy = float(params.get("center_lng", 0))
                         r = float(params.get("radius_km", 20))
                         # 检查起点终点是否经过禁区
                         if haversine(end_lat, end_lng, cx, cy) < r:
-                            penalty_score += p_amount
+                            penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
                         if haversine(start_lat, start_lng, cx, cy) < r:
-                            penalty_score += p_amount
+                            penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
 
             # 聚类价值（替代原spatial_bonus）（Task #2）
             cluster_value = self._compute_cluster_value(end_lat, end_lng, state)
@@ -1758,6 +1785,7 @@ class HeuristicLayer:
                 + cluster_value
                 + net_profit * 0.15
                 + scarcity_factor
+                - idle_day_penalty
             )
 
             scored.append({
@@ -1782,14 +1810,19 @@ class HeuristicLayer:
         return scored[:top_n]
 
     @staticmethod
-    def _get_banned_categories(constraints: list[dict]) -> set[str]:
-        banned: set[str] = set()
+    def _get_banned_categories(constraints: list[dict]) -> tuple[set[str], set[str]]:
+        hard_banned: set[str] = set()
+        soft_banned: set[str] = set()
         for c in constraints:
             if c.get("type") == "cargo_category_ban":
+                severity = c.get("severity", "hard")
                 params = c.get("params", {})
                 for item in params.get("banned_categories", []):
-                    banned.add(str(item))
-        return banned
+                    if severity == "hard":
+                        hard_banned.add(str(item))
+                    else:
+                        soft_banned.add(str(item))
+        return hard_banned, soft_banned
 
     @staticmethod
     def _get_monthly_deadhead_cap(constraints: list[dict]) -> float | None:
@@ -2312,6 +2345,86 @@ class ModelDecisionService:
             self._logger.error("决策异常 driver=%s: %s", driver_id, e, exc_info=True)
             return {"action": "wait", "params": {"duration_minutes": 60}}
 
+    def _validate_action(self, decision: dict, status: dict, constraints: list[dict]) -> dict | None:
+        """统一动作安全校验，拒绝危险动作返回 None（调用方跳过该决策继续下一层）。"""
+        action = decision.get("action", "")
+        params = decision.get("params", {})
+        current_min = int(status.get("simulation_progress_minutes", 0))
+        horizon = _get_horizon_minutes(status)
+
+        if action == "reposition":
+            lat = float(params.get("latitude", 0))
+            lng = float(params.get("longitude", 0))
+            cur_lat = float(status.get("current_lat", 0))
+            cur_lng = float(status.get("current_lng", 0))
+
+            # 拒绝 (0,0) 或超出中国范围
+            if (lat == 0 and lng == 0) or not (_CHINA_LAT_RANGE[0] <= lat <= _CHINA_LAT_RANGE[1] and _CHINA_LNG_RANGE[0] <= lng <= _CHINA_LNG_RANGE[1]):
+                self._logger.warning("安全闸拦截: reposition(%s,%s) 坐标异常，跳过该规则决策", lat, lng)
+                return None
+
+            # 拒绝单次空驶 > 300km
+            dist = haversine(cur_lat, cur_lng, lat, lng)
+            if dist > _MAX_SINGLE_REPOSITION_KM:
+                self._logger.warning("安全闸拦截: reposition 距离 %.1fkm 超限，跳过该规则决策", dist)
+                return None
+
+            # 拒绝执行后超 horizon
+            travel_min = _distance_to_minutes(dist)
+            if current_min + travel_min > horizon:
+                self._logger.warning("安全闸拦截: reposition 将超出 horizon，跳过该规则决策")
+                return None
+
+            # 拒绝违反显式空间约束
+            for c in constraints:
+                if c.get("type") == "spatial_restrict":
+                    p = c.get("params", {})
+                    if p.get("type") == "bounding_box":
+                        bb = p.get("bounding_box", {})
+                        if not PreferenceEngine._in_bounding_box(lat, lng, bb):
+                            self._logger.warning("安全闸拦截: reposition 违反 bounding_box 约束，跳过该规则决策")
+                            return None
+                    elif p.get("type") == "forbidden_circle":
+                        cx = float(p.get("center_lat", 0))
+                        cy = float(p.get("center_lng", 0))
+                        r = float(p.get("radius_km", 20))
+                        if haversine(lat, lng, cx, cy) < r:
+                            self._logger.warning("安全闸拦截: reposition 进入禁入圆区，跳过该规则决策")
+                            return None
+
+        return decision  # 通过校验
+
+    def _validate_take_order_feasibility(self, cargo_id: str, items: list[dict],
+                                          status: dict) -> bool:
+        """校验 take_order 是否能在 horizon 内完成。"""
+        current_min = int(status.get("simulation_progress_minutes", 0))
+        horizon = _get_horizon_minutes(status)
+        lat = float(status.get("current_lat", 0))
+        lng = float(status.get("current_lng", 0))
+
+        for item in items:
+            cargo = item.get("cargo", {})
+            if str(cargo.get("cargo_id", "")) != str(cargo_id):
+                continue
+            distance_km = float(item.get("distance_km", 0))
+            cost_time = int(cargo.get("cost_time_minutes", 0))
+            load_time = cargo.get("load_time")
+
+            deadhead_min = _distance_to_minutes(distance_km)
+            wait_for_load = 0
+            if load_time and isinstance(load_time, list) and len(load_time) == 2:
+                try:
+                    window_start = _wall_to_sim_minutes(str(load_time[0]).strip())
+                    arrival = current_min + deadhead_min
+                    wait_for_load = max(0, window_start - arrival)
+                except Exception:
+                    pass
+
+            total_time = deadhead_min + wait_for_load + cost_time
+            return current_min + total_time <= horizon
+
+        return False  # 未找到 cargo 信息时拒绝（安全优先）
+
     def _decide_impl(self, driver_id: str) -> dict:
         # 1. 获取状态
         status = self._api.get_driver_status(driver_id)
@@ -2365,9 +2478,18 @@ class ModelDecisionService:
         # 4. 规则层快速路径（先不查货源的规则）
         rule_decision = self._rule_layer.evaluate(status, state, constraints, None)
         if rule_decision is not None:
-            self._logger.info("规则层决策 driver=%s action=%s", driver_id, rule_decision.get("action"))
-            self._update_state_after_decision(state, rule_decision, current_min)
-            return rule_decision
+            rule_decision = self._validate_action(rule_decision, status, constraints)
+            if rule_decision is None:
+                self._logger.info("规则层决策被安全闸拦截，跳过继续下一层 driver=%s", driver_id)
+            else:
+                # 无货源数据时拒绝 take_order：无法校验 cargo 存在性、可见性、时效
+                if rule_decision.get("action") == "take_order":
+                    self._logger.info("规则层(无货源) 产出 take_order 但无法校验，跳过等查货后处理 driver=%s", driver_id)
+                    rule_decision = None
+                if rule_decision is not None:
+                    self._logger.info("规则层决策 driver=%s action=%s", driver_id, rule_decision.get("action"))
+                    self._update_state_after_decision(state, rule_decision, current_min)
+                    return rule_decision
 
         # 5. 查询货源
         cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng)
@@ -2409,21 +2531,36 @@ class ModelDecisionService:
                             "longitude": float(suggestion["target_lng"]),
                         },
                     }
-                    self._logger.info(
-                        "主动空驶 driver=%s -> (%.2f,%.2f) net_value=%.1f",
-                        driver_id, suggestion["target_lat"],
-                        suggestion["target_lng"], suggestion["net_value"])
-                    self._update_state_after_decision(state, decision, current_min)
-                    return decision
+                    decision = self._validate_action(decision, status_after_query, constraints)
+                    if decision is not None:
+                        self._logger.info(
+                            "主动空驶 driver=%s -> (%.2f,%.2f) net_value=%.1f",
+                            driver_id, suggestion["target_lat"],
+                            suggestion["target_lng"], suggestion["net_value"])
+                        self._update_state_after_decision(state, decision, current_min)
+                        return decision
+                    else:
+                        self._logger.info("主动空驶被安全闸拦截，跳过 driver=%s", driver_id)
         except Exception as e:
             self._logger.warning("主动空驶判定异常: %s", e)
 
         # 6. 再次检查规则层（带货源信息）
         rule_decision = self._rule_layer.evaluate(status_after_query, state, constraints, items)
         if rule_decision is not None:
-            self._logger.info("规则层决策(带货源) driver=%s action=%s", driver_id, rule_decision.get("action"))
-            self._update_state_after_decision(state, rule_decision, current_min)
-            return rule_decision
+            rule_decision = self._validate_action(rule_decision, status_after_query, constraints)
+            if rule_decision is None:
+                self._logger.info("规则层决策(带货源)被安全闸拦截，跳过继续下一层 driver=%s", driver_id)
+            else:
+                # take_order horizon 校验（有 items 时用完整校验）
+                if rule_decision.get("action") == "take_order":
+                    cargo_id = rule_decision.get("params", {}).get("cargo_id", "")
+                    if not self._validate_take_order_feasibility(cargo_id, items, status_after_query):
+                        self._logger.info("规则层 take_order 可行性校验失败，跳过 driver=%s", driver_id)
+                        rule_decision = None
+                if rule_decision is not None:
+                    self._logger.info("规则层决策(带货源) driver=%s action=%s", driver_id, rule_decision.get("action"))
+                    self._update_state_after_decision(state, rule_decision, current_min)
+                    return rule_decision
 
         # 7. 无货源时默认等待
         if not items:
@@ -2456,6 +2593,8 @@ class ModelDecisionService:
                 # Token 预算紧张时直接用启发式结果
                 if state.is_token_budget_exceeded():
                     decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
+                    if not self._validate_take_order_feasibility(candidates[0]["cargo_id"], items, status_after_query):
+                        decision = {"action": "wait", "params": {"duration_minutes": 30}}
                     self._logger.info("快速接单(token降级) driver=%s cargo=%s",
                                       driver_id, candidates[0]["cargo_id"])
                     self._update_state_after_decision(state, decision, current_min, candidates)
@@ -2464,7 +2603,10 @@ class ModelDecisionService:
         # 10. Token 预算降级：超阈值时不调 LLM
         if state.is_token_budget_exceeded():
             if candidates and candidates[0]["score"] > 0 and candidates[0]["penalty_score"] == 0:
-                decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
+                if self._validate_take_order_feasibility(candidates[0]["cargo_id"], items, status_after_query):
+                    decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
+                else:
+                    decision = {"action": "wait", "params": {"duration_minutes": 30}}
             else:
                 decision = {"action": "wait", "params": {"duration_minutes": 60}}
             self._update_state_after_decision(state, decision, current_min, candidates)
@@ -2490,7 +2632,10 @@ class ModelDecisionService:
         if not self.token_optimizer.should_use_llm(driver_id, _decision_complexity, _remaining_steps):
             # Token预算建议不使用LLM，直接用启发式结果
             if candidates and candidates[0]["score"] > 0 and candidates[0]["penalty_score"] == 0:
-                decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
+                if self._validate_take_order_feasibility(candidates[0]["cargo_id"], items, status_after_query):
+                    decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
+                else:
+                    decision = {"action": "wait", "params": {"duration_minutes": 30}}
             else:
                 decision = {"action": "wait", "params": {"duration_minutes": 60}}
             self._logger.info("Token智能分配跳过LLM driver=%s complexity=%s strategy=%s",
@@ -2517,6 +2662,15 @@ class ModelDecisionService:
         # 记录 token
         # (token 由 EmbeddedDecisionEnvironment 自动追踪，这里仅更新本地计数)
 
+        decision = self._validate_action(decision, status_after_query, constraints)
+        if decision is None:
+            self._logger.info("LLM决策被安全闸拦截，fallback wait driver=%s", driver_id)
+            decision = {"action": "wait", "params": {"duration_minutes": 30}}
+        # 统一接单 horizon 校验
+        if decision.get("action") == "take_order":
+            cargo_id = decision.get("params", {}).get("cargo_id", "")
+            if not self._validate_take_order_feasibility(cargo_id, items, status_after_query):
+                decision = {"action": "wait", "params": {"duration_minutes": 30}}
         self._update_state_after_decision(state, decision, current_min, candidates)
 
         # Task #7: 记录决策到协调层
