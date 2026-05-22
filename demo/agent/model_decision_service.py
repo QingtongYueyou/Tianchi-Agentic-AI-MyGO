@@ -27,6 +27,17 @@ _CHINA_LAT_RANGE = (18.0, 54.0)
 _CHINA_LNG_RANGE = (73.0, 136.0)
 _MAX_SINGLE_REPOSITION_KM = 300.0
 
+# ── true_net 参数 ──
+_PENALTY_MARGIN = 200                    # 吃罚候选 true_net 需超过安全候选的最小差额
+_MAX_SOFT_PENALTY_PER_DAY = 300
+_MAX_SOFT_PENALTY_PER_ORDER = 300
+_MAX_SOFT_PENALTY_PER_MONTH = 1000
+_LONG_ORDER_THRESHOLD_MINUTES = 360      # 6 小时
+_HEAVY_DEADHEAD_KM = 90
+_EXTREME_DEADHEAD_KM = 150
+_DEADHEAD_REJECT_TRUE_NET = 800          # 极端空驶需 true_net 达标才允许
+_LONG_ORDER_REJECT_TRUE_NET = 500        # >10h 长单需 true_net 达标才允许
+
 _logger = logging.getLogger("agent.hybrid_decision")
 
 
@@ -2095,7 +2106,7 @@ class HeuristicLayer:
             )
 
         # 上限封顶：防止远距离终点把评分打爆
-        return min(cost, 200.0)
+        return min(cost, 300.0)
 
     @staticmethod
     def _build_mandatory_pickup_info(
@@ -2165,6 +2176,218 @@ class HeuristicLayer:
             except (ValueError, TypeError):
                 continue
         return result
+
+    # ── true_net 分类与估算方法 ──
+
+    @staticmethod
+    def classify_constraint_severity(constraint: dict) -> str:
+        """返回约束的实际严重级别 'hard' 或 'soft'。
+
+        Hard: mandatory_cargo, scheduled_event, time_restriction,
+              spatial_restrict(forbidden_circle),
+              daily_home_deadline 仅当 severity=hard 且 penalty>=500。
+        Soft: daily_rest, day_off_requirement, monthly_visit_requirement,
+              daily_home_deadline(默认), soft cargo_category_ban。
+        """
+        ctype = constraint.get("type", "")
+        severity = constraint.get("severity", "hard")
+
+        if ctype in ("mandatory_cargo", "scheduled_event", "time_restriction"):
+            return "hard"
+        if ctype == "spatial_restrict":
+            params = constraint.get("params", {})
+            if params.get("type") == "forbidden_circle":
+                return "hard"
+            return "hard" if severity == "hard" else "soft"
+        if ctype == "daily_home_deadline":
+            penalty = float(constraint.get("penalty_amount", 0) or 0)
+            if severity == "hard" and penalty >= 500:
+                return "hard"
+            return "soft"
+        if ctype in ("daily_rest", "day_off_requirement", "monthly_visit_requirement"):
+            return "soft"
+        if ctype == "cargo_category_ban":
+            return "soft" if severity == "soft" else "hard"
+        return severity if severity in ("hard", "soft") else "hard"
+
+    def _estimate_soft_penalty_cost(
+        self,
+        constraint: dict,
+        cargo_name: str,
+        distance_km: float,
+        haul_km: float,
+        end_lat: float,
+        end_lng: float,
+        finish_min: int,
+        current_min: int,
+        state: StateTracker,
+    ) -> float:
+        """估算违反软约束的经济成本（元），从 true_net 中扣除。"""
+        ctype = constraint.get("type", "")
+        p_amount = float(constraint.get("penalty_amount", 0) or 0)
+        params = constraint.get("params", {})
+
+        if ctype == "daily_rest":
+            required_min = int(params.get("min_continuous_minutes", 0))
+            if required_min <= 0:
+                return 0.0
+            current_rest = state.get_max_continuous_rest_today(current_min)
+            if current_rest >= required_min:
+                return 0.0
+            remaining_after = 1440 - (finish_min % 1440)
+            need = required_min - current_rest
+            if remaining_after < need:
+                return max(p_amount, 300.0)
+            return 0.0
+
+        if ctype == "daily_home_deadline":
+            if p_amount > 0:
+                return p_amount * 0.5
+            return 150.0
+
+        if ctype == "cargo_category_ban":
+            return p_amount * 0.5 if p_amount > 0 else 50.0
+
+        if ctype == "max_deadhead_distance":
+            max_km = float(params.get("max_deadhead_km", 9999))
+            if distance_km > max_km:
+                return p_amount if p_amount > 0 else (distance_km - max_km) * 10.0
+            return 0.0
+
+        if ctype == "mileage_cap":
+            max_km = float(params.get("max_deadhead_km", 9999))
+            if state.total_deadhead_km + distance_km > max_km:
+                over = state.total_deadhead_km + distance_km - max_km
+                return max(p_amount, over * 10.0)
+            return 0.0
+
+        if ctype == "max_haul_distance":
+            max_km = float(params.get("max_km", 9999))
+            if haul_km > max_km:
+                return p_amount if p_amount > 0 else (haul_km - max_km) * 5.0
+            return 0.0
+
+        if ctype == "day_off_requirement":
+            return p_amount * 0.3 if p_amount > 0 else 100.0
+
+        if ctype == "monthly_visit_requirement":
+            return p_amount * 0.2 if p_amount > 0 else 80.0
+
+        return p_amount * 0.5 if p_amount > 0 else 0.0
+
+    def _estimate_hard_penalty(
+        self,
+        constraint: dict,
+        cargo_name: str,
+        distance_km: float,
+        haul_km: float,
+        end_lat: float,
+        end_lng: float,
+        state: StateTracker,
+    ) -> float:
+        """估算硬约束的罚分成本（用于排序，不用于过滤）。"""
+        ctype = constraint.get("type", "")
+        p_amount = float(constraint.get("penalty_amount", 0) or 0)
+        params = constraint.get("params", {})
+
+        if ctype == "spatial_restrict" and params.get("type") == "bounding_box":
+            bb = params.get("bounding_box", {})
+            if not PreferenceEngine._in_bounding_box(end_lat, end_lng, bb):
+                return p_amount * 2.0 if p_amount else 2000.0
+        if ctype == "max_deadhead_distance":
+            max_km = float(params.get("max_deadhead_km", 9999))
+            if distance_km > max_km:
+                return p_amount * 2.0 if p_amount else (distance_km - max_km) * 20.0
+        if ctype == "max_haul_distance":
+            max_km = float(params.get("max_km", 9999))
+            if haul_km > max_km:
+                return p_amount * 2.0 if p_amount else (haul_km - max_km) * 15.0
+        if ctype == "daily_home_deadline":
+            # 硬约束：高罚分（>=500），全额计入
+            return p_amount * 2.0 if p_amount else 1000.0
+        if ctype == "cargo_category_ban":
+            return p_amount * 2.0 if p_amount else 500.0
+        return 0.0
+
+    @staticmethod
+    def _compute_long_order_penalty(total_minutes: int) -> float:
+        """长途订单惩罚。"""
+        if total_minutes > 600:
+            return 300.0
+        if total_minutes > 480:
+            return 180.0
+        if total_minutes > _LONG_ORDER_THRESHOLD_MINUTES:
+            return 80.0
+        return 0.0
+
+    @staticmethod
+    def _compute_deadhead_risk_cost(deadhead_km: float) -> float:
+        """大空驶风险成本。"""
+        if deadhead_km > _EXTREME_DEADHEAD_KM:
+            return 500.0
+        if deadhead_km > _HEAVY_DEADHEAD_KM:
+            return 200.0
+        if deadhead_km > 60:
+            return 80.0
+        return 0.0
+
+    @staticmethod
+    def _compute_short_safe_order_bonus(
+        total_minutes: int, net_profit: float, breaks_critical: bool,
+    ) -> float:
+        """短单安全奖励。"""
+        if total_minutes <= 180 and net_profit >= 80 and not breaks_critical:
+            return 60.0
+        return 0.0
+
+    @staticmethod
+    def estimate_wait_value(
+        current_min: int,
+        state: StateTracker,
+        constraints: list[dict],
+        horizon: int,
+        opportunity_predictor: "OpportunityPredictor | None" = None,
+    ) -> float:
+        """估算等待动作的价值（元）。
+
+        wait_value = 未来货源预期收益 - 时间成本 + 休息补足价值 + 任务准备价值
+        """
+        hour = _get_hour_of_day(current_min)
+
+        future_income = 0.0
+        if opportunity_predictor:
+            try:
+                prediction = opportunity_predictor.predict_next_hours(hour, 2)
+                future_income = prediction.get("expected_avg_price", 0) * 0.3
+            except Exception:
+                pass
+
+        time_cost = 25.0  # 30min ≈ 25 元机会成本
+
+        rest_value = 0.0
+        for c in constraints:
+            if c.get("type") != "daily_rest":
+                continue
+            required = int(c.get("params", {}).get("min_continuous_minutes", 0))
+            if required <= 0:
+                continue
+            current_rest = state.get_max_continuous_rest_today(current_min)
+            if current_rest < required:
+                rest_value = 200.0
+                break
+
+        task_prep_value = 0.0
+        if hasattr(state, "open_tasks"):
+            for task in state.open_tasks:
+                if task.get("type") == "mandatory_cargo":
+                    activation = task.get("activation_min", 0)
+                    if 0 < activation - current_min < 360:
+                        task_prep_value = 100.0
+                        break
+
+        night_penalty = 30.0 if (hour >= 22 or hour < 6) else 0.0
+
+        return future_income - time_cost + rest_value + task_prep_value - night_penalty
 
     def score_and_rank(self, items: list[dict], status: dict, state: StateTracker,
                        constraints: list[dict], top_n: int = 5) -> list[dict]:
@@ -2242,25 +2465,9 @@ class HeuristicLayer:
             if _violates_time_restriction(current_min, current_min + total_time, constraints):
                 continue
 
-            # 过滤: 接单后当天剩余时间不够补足连续休息
+            # daily_rest 不再硬过滤，由 soft_penalty_cost 经济惩罚处理
+            # RuleLayer._check_forced_rest 在剩余时间仅够补休时仍会强制 wait
             _finish = current_min + total_time
-            for _c in constraints:
-                if _c.get("type") != "daily_rest":
-                    continue
-                _rp = _c.get("params", {})
-                _req = int(_rp.get("min_continuous_minutes", 0))
-                if _req <= 0:
-                    continue
-                _cur_rest = state.get_max_continuous_rest_today(current_min)
-                if _cur_rest >= _req:
-                    break
-                _need = _req - _cur_rest
-                _remain_after = 1440 - (_finish % 1440)
-                if _remain_after < _need:
-                    total_time = -1  # mark as invalid
-                    break
-            if total_time < 0:
-                continue
 
             # 过滤: 候选完成后赶不到 mandatory_cargo pickup 的订单
             # 仅在 mandatory 窗口临近（<12h）时才硬过滤，否则交给评分惩罚
@@ -2292,87 +2499,54 @@ class HeuristicLayer:
             total_minutes = deadhead_min + cost_time
             time_efficiency = net_profit / max(total_minutes, 1)
 
-            # 偏好合规性评估
-            penalty_score = 0.0
+            # ── true_net: 区分硬/软约束，经济化处理 ──
+            hard_penalty = 0.0
+            soft_penalty_cost = 0.0
+            has_soft_penalty = False
+
             for c in constraints:
-                ctype = c.get("type", "")
-                params = c.get("params", {})
-                p_amount = float(c.get("penalty_amount", 0))
-                severity = c.get("severity", "hard")
+                c_severity = self.classify_constraint_severity(c)
+                if c_severity == "hard":
+                    hard_penalty += self._estimate_hard_penalty(
+                        c, cargo_name, distance_km, haul_km,
+                        end_lat, end_lng, state)
+                else:
+                    cost_p = self._estimate_soft_penalty_cost(
+                        c, cargo_name, distance_km, haul_km,
+                        end_lat, end_lng, _finish, current_min, state)
+                    if cost_p > 0:
+                        soft_penalty_cost += cost_p
+                        has_soft_penalty = True
 
-                if ctype == "cargo_category_ban":
-                    banned = params.get("banned_categories", [])
-                    for b in banned:
-                        if b in cargo_name:
-                            penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
-                            break
+            soft_penalty_cost = min(soft_penalty_cost, _MAX_SOFT_PENALTY_PER_ORDER)
 
-                elif ctype == "max_deadhead_distance":
-                    max_km = float(params.get("max_deadhead_km", 9999))
-                    if distance_km > max_km:
-                        penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
-
-                elif ctype == "mileage_cap":
-                    max_km = float(params.get("max_deadhead_km", 9999))
-                    if state.total_deadhead_km + distance_km > max_km:
-                        over = state.total_deadhead_km + distance_km - max_km
-                        penalty_score += max(p_amount, over * 10.0) * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
-
-                elif ctype == "max_haul_distance":
-                    max_km = float(params.get("max_km", 9999))
-                    if haul_km > max_km:
-                        penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
-
-                elif ctype == "spatial_restrict":
-                    if params.get("type") == "bounding_box":
-                        bb = params.get("bounding_box", {})
-                        if not PreferenceEngine._in_bounding_box(end_lat, end_lng, bb):
-                            penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
-                    elif params.get("type") == "forbidden_circle":
-                        cx = float(params.get("center_lat", 0))
-                        cy = float(params.get("center_lng", 0))
-                        r = float(params.get("radius_km", 20))
-                        # 检查起点终点是否经过禁区
-                        if haversine(end_lat, end_lng, cx, cy) < r:
-                            penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
-                        if haversine(start_lat, start_lng, cx, cy) < r:
-                            penalty_score += p_amount * (2.0 if severity == "hard" else 0.5 if severity == "soft" else 1.0)
-
-            # 聚类价值（替代原spatial_bonus）（Task #2）
+            # 聚类价值
             cluster_value = self._compute_cluster_value(end_lat, end_lng, state)
 
-            # 偏好影响评估（Task #2）
-            item_for_assess = {"total_minutes": total_minutes, "cost_time_minutes": cost_time}
-            preference_impact = self._assess_preference_impact(item_for_assess, state, constraints)
-
-            # 稀缺性因子（Task #2）
+            # 稀缺性因子
             scarcity_factor = self._get_scarcity_factor(item, state)
-            deadhead_ratio = distance_km / max(1.0, distance_km + haul_km)
-            deadhead_penalty = deadhead_ratio * 100.0
-            if monthly_deadhead_cap is not None:
-                remaining_quota = monthly_deadhead_cap - state.total_deadhead_km
-                if distance_km > remaining_quota:
-                    deadhead_penalty += max(0.0, distance_km - remaining_quota) * 10.0
+
+            # 长途惩罚 / 大空驶风险 / 短单奖励
+            long_order_penalty = self._compute_long_order_penalty(total_time)
+            deadhead_risk_cost = self._compute_deadhead_risk_cost(distance_km)
+            short_safe_bonus = self._compute_short_safe_order_bonus(
+                total_time, net_profit, False)
 
             finish_min = current_min + total_time
             future_position_cost = self._future_position_cost(
-                end_lat,
-                end_lng,
-                finish_min,
-                constraints,
-                state,
-                horizon,
-                mandatory_pickups,
+                end_lat, end_lng, finish_min,
+                constraints, state, horizon, mandatory_pickups,
             )
 
-            # 新综合评分公式（Task #2）
-            score = (
-                time_efficiency * 60 * time_phase_multiplier
-                - penalty_score * 2.0 * (1 + preference_impact)
-                - deadhead_penalty
+            # ── true_net 评分公式 ──
+            true_net_score = (
+                net_profit
                 - future_position_cost
+                - soft_penalty_cost
+                - long_order_penalty
+                - deadhead_risk_cost
+                + short_safe_bonus
                 + cluster_value
-                + net_profit * 0.25
                 + scarcity_factor
                 - idle_day_penalty
             )
@@ -2384,11 +2558,16 @@ class HeuristicLayer:
                 "net_profit": round(net_profit, 2),
                 "deadhead_km": round(distance_km, 2),
                 "haul_km": round(haul_km, 2),
-                "total_minutes": total_minutes,
+                "total_minutes": total_time,
                 "time_efficiency": round(time_efficiency, 4),
-                "penalty_score": round(penalty_score, 2),
+                "penalty_score": round(soft_penalty_cost, 2),
+                "has_soft_penalty": has_soft_penalty,
+                "hard_penalty": round(hard_penalty, 2),
                 "future_position_cost": round(future_position_cost, 2),
-                "score": round(score, 4),
+                "long_order_penalty": round(long_order_penalty, 2),
+                "deadhead_risk_cost": round(deadhead_risk_cost, 2),
+                "score": round(true_net_score, 4),
+                "true_net": round(true_net_score, 4),
                 "start": {"lat": start_lat, "lng": start_lng},
                 "end": {"lat": end_lat, "lng": end_lng},
                 "load_time": load_time,
@@ -2469,13 +2648,15 @@ class LLMLayer:
             context["候选货源"].append({
                 "cargo_id": c["cargo_id"],
                 "品类": c.get("cargo_name", ""),
+                "true_net": c.get("true_net", c.get("score", 0)),
                 "净利润元": c["net_profit"],
                 "空驶km": c["deadhead_km"],
                 "总耗时分钟": c["total_minutes"],
-                "时间效率": c["time_efficiency"],
-                "违规罚款": c["penalty_score"],
+                "有软罚分": c.get("has_soft_penalty", False),
+                "罚分成本": c.get("penalty_score", 0),
                 "未来位置成本": c.get("future_position_cost", 0),
-                "评分": c["score"],
+                "长途惩罚": c.get("long_order_penalty", 0),
+                "空驶风险成本": c.get("deadhead_risk_cost", 0),
             })
 
         # 添加关键约束提示
@@ -2504,8 +2685,9 @@ class LLMLayer:
             resp = self._api.model_chat_completion({
                 "messages": [
                     {"role": "system", "content": (
-                        "你是高级货运调度员。结合历史模式、未来货源预测、"
-                        "偏好约束时间线进行决策。优先保障偏好不违规，其次最大化收益。"
+                        "你是高级货运调度员。根据true_net(真实净利润=收入-成本-罚分)进行决策。"
+                        "优先选择true_net最高的候选。如果所有候选true_net<0，选择等待。"
+                        "允许小额软罚分(如有软罚分=true)只要true_net仍为正且明显优于无罚方案。"
                         "只输出JSON: {\"action\":\"take_order|wait|reposition\","
                         "\"cargo_id\":\"仅take_order需要\","
                         "\"duration_minutes\":正整数(仅wait),"
@@ -2976,6 +3158,40 @@ class ModelDecisionService:
 
         return decision  # 通过校验
 
+    @staticmethod
+    def _select_best_by_true_net(candidates: list[dict]) -> dict | None:
+        """按 true_net 选择最佳候选：安全候选 vs 吃罚候选，取 penalty_margin 决策。"""
+        if not candidates:
+            return None
+
+        safe = [c for c in candidates if not c.get("has_soft_penalty", False)]
+        penalty = [c for c in candidates if c.get("has_soft_penalty", False)]
+
+        best_safe = max(safe, key=lambda c: c.get("true_net", c["score"])) if safe else None
+        best_penalty = max(penalty, key=lambda c: c.get("true_net", c["score"])) if penalty else None
+
+        chosen = None
+        if best_penalty and best_safe:
+            pn = best_penalty.get("true_net", best_penalty["score"])
+            sn = best_safe.get("true_net", best_safe["score"])
+            chosen = best_penalty if pn > sn + _PENALTY_MARGIN else best_safe
+        elif best_safe:
+            chosen = best_safe
+        elif best_penalty:
+            chosen = best_penalty
+
+        if chosen is None:
+            return None
+
+        # 极端情况拒绝：>10h 或 >150km 空驶，除非 true_net 足够高
+        tn = chosen.get("true_net", chosen["score"])
+        if chosen["total_minutes"] > 600 and tn < _LONG_ORDER_REJECT_TRUE_NET:
+            return None
+        if chosen["deadhead_km"] > _EXTREME_DEADHEAD_KM and tn < _DEADHEAD_REJECT_TRUE_NET:
+            return None
+
+        return chosen
+
     def _validate_take_order_feasibility(self, cargo_id: str, items: list[dict],
                                           status: dict) -> bool:
         """校验 take_order 是否能在 horizon 内完成。"""
@@ -3107,7 +3323,7 @@ class ModelDecisionService:
         if _violates_time_restriction(current_min, finish_min, constraints):
             return False, "violates_time_restriction"
 
-        # 6. daily_home_deadline：完单后必须能回家
+        # 6. daily_home_deadline：完单后能否回家（软化：仅高罚分硬拒）
         for c in constraints:
             if c.get("type") != "daily_home_deadline":
                 continue
@@ -3126,7 +3342,10 @@ class ModelDecisionService:
                 haversine(end_lat, end_lng, float(home_lat), float(home_lng))
             )
             if finish_min + travel_home_min > today_deadline:
-                return False, "cannot_return_home_before_deadline"
+                c_severity = HeuristicLayer.classify_constraint_severity(c)
+                if c_severity == "hard":
+                    return False, "cannot_return_home_before_deadline"
+                # 软约束：允许通过，由评分层经济惩罚
 
         # 7. scheduled_event：不能跨过事件时间窗（仅检查未完成的 open task）
         _has_open_scheduled_event = any(
@@ -3180,7 +3399,8 @@ class ModelDecisionService:
                 if finish_min + travel_to_visit > day_end:
                     return False, "cannot_reach_visit_point_today"
 
-        # 9. daily_rest：接单后当天剩余时间必须足够补足连续休息
+        # 9. daily_rest：软化处理——不再硬拒，由评分层经济惩罚
+        # RuleLayer._check_forced_rest 在剩余时间仅够补休时仍会强制 wait
         for c in constraints:
             if c.get("type") != "daily_rest":
                 continue
@@ -3190,11 +3410,26 @@ class ModelDecisionService:
                 continue
             current_rest = state.get_max_continuous_rest_today(current_min)
             if current_rest >= required_min:
-                continue  # 已满足
+                continue
             need = required_min - current_rest
             remaining_after_order = 1440 - (finish_min % 1440)
             if remaining_after_order < need:
-                return False, "order_prevents_daily_rest_completion"
+                # 不再 return False，由 soft_penalty_cost 处理
+                pass
+
+        # 10. 链式失败检查：接单会导致 mandatory_cargo(<12h) 无法完成 → 硬拒
+        _mandatory_pickups = HeuristicLayer._build_mandatory_pickup_info(
+            state, constraints, None)
+        if _mandatory_pickups:
+            for mp in _mandatory_pickups:
+                deadline = mp.get("window_end", mp["activation_min"])
+                if deadline - current_min > 720:
+                    continue
+                travel_to_pickup = _distance_to_minutes(
+                    haversine(end_lat, end_lng, mp["pickup_lat"], mp["pickup_lng"])
+                )
+                if finish_min + travel_to_pickup > deadline:
+                    return False, "order_would_miss_mandatory_cargo"
 
         return True, ""
 
@@ -3434,9 +3669,12 @@ class ModelDecisionService:
                     self._update_state_after_decision(state, rule_decision, current_min)
                     return rule_decision
 
-        # 7. 无货源时默认等待
+        # 7. 无货源时：评估 wait value 而非默认 wait 30
         if not items:
-            decision = {"action": "wait", "params": {"duration_minutes": 30}}
+            wait_val = HeuristicLayer.estimate_wait_value(
+                current_min, state, constraints, horizon, self.opportunity_predictor)
+            wait_duration = 30 if wait_val > -100 else 60
+            decision = {"action": "wait", "params": {"duration_minutes": wait_duration}}
             self._update_state_after_decision(state, decision, current_min)
             return decision
 
@@ -3471,16 +3709,15 @@ class ModelDecisionService:
         # 同步 StateTracker 的 token 用量到 token_optimizer
         self.token_optimizer.usage_tracker[driver_id] = state.total_tokens_used
 
-        # 9. 快速接单路径：如果最优候选评分远超第二，且无违规，直接接单
-        if (len(candidates) >= 1 and
-                candidates[0]["score"] > -50 and
-                candidates[0]["penalty_score"] == 0 and
-                candidates[0]["net_profit"] > 80):
-            if len(candidates) == 1 or candidates[0]["score"] > candidates[1]["score"] * 1.3:
-                # Token 预算紧张时直接用启发式结果
+        # 9. 快速接单路径：基于 true_net 的安全/吃罚候选分离
+        _chosen = self._select_best_by_true_net(candidates)
+        if _chosen is not None:
+            _cid = _chosen["cargo_id"]
+            _chosen_tn = _chosen.get("true_net", _chosen["score"])
+            # 仅 true_net > 0 且无硬罚分时快速接单
+            if _chosen.get("hard_penalty", 0) == 0 and _chosen_tn > 0:
                 if state.is_token_budget_exceeded():
-                    decision = {"action": "take_order", "params": {"cargo_id": candidates[0]["cargo_id"]}}
-                    _cid = candidates[0]["cargo_id"]
+                    decision = {"action": "take_order", "params": {"cargo_id": _cid}}
                     if not self._validate_take_order_feasibility(_cid, items, status_after_query):
                         decision = {"action": "wait", "params": {"duration_minutes": 30}}
                     else:
@@ -3490,21 +3727,21 @@ class ModelDecisionService:
                             self._logger.info("快速接单约束校验失败 driver=%s cargo=%s reason=%s",
                                               driver_id, _cid, reason)
                             decision = {"action": "wait", "params": {"duration_minutes": 30}}
-                    # 快速路径也要经过 reviewer（遵守 95% 阈值）
                     decision = self._maybe_review_decision(
                         decision, candidates, state, status_after_query,
                         constraints, current_min, driver_id,
                         _decision_complexity, _remaining_steps, items,
                     )
-                    self._logger.info("快速接单(token降级) driver=%s cargo=%s",
-                                      driver_id, decision.get("params", {}).get("cargo_id", ""))
+                    self._logger.info("快速接单(token降级) driver=%s cargo=%s true_net=%.1f",
+                                      driver_id, _cid, _chosen_tn)
                     self._update_state_after_decision(state, decision, current_min, candidates)
                     return decision
 
         # 10. Token 预算降级：超阈值时不调 LLM
         if state.is_token_budget_exceeded():
-            if candidates and candidates[0]["score"] > -50 and candidates[0]["penalty_score"] == 0:
-                _cid = candidates[0]["cargo_id"]
+            _chosen = self._select_best_by_true_net(candidates)
+            if _chosen and _chosen.get("true_net", _chosen["score"]) > 0 and _chosen.get("hard_penalty", 0) == 0:
+                _cid = _chosen["cargo_id"]
                 if self._validate_take_order_feasibility(_cid, items, status_after_query):
                     ok, reason = self._validate_take_order_constraints(
                         _cid, items, status_after_query, constraints, state)
@@ -3518,7 +3755,6 @@ class ModelDecisionService:
                     decision = {"action": "wait", "params": {"duration_minutes": 30}}
             else:
                 decision = {"action": "wait", "params": {"duration_minutes": 60}}
-            # token降级路径也要经过 reviewer（遵守 95% 阈值）
             decision = self._maybe_review_decision(
                 decision, candidates, state, status_after_query,
                 constraints, current_min, driver_id,
@@ -3529,9 +3765,9 @@ class ModelDecisionService:
 
         # 10.5 Token预算智能分配检查（Task #6）
         if not self.token_optimizer.should_use_llm(driver_id, _decision_complexity, _remaining_steps):
-            # Token预算建议不使用LLM，直接用启发式结果
-            if candidates and candidates[0]["score"] > -50 and candidates[0]["penalty_score"] == 0:
-                _cid = candidates[0]["cargo_id"]
+            _chosen = self._select_best_by_true_net(candidates)
+            if _chosen and _chosen.get("true_net", _chosen["score"]) > 0 and _chosen.get("hard_penalty", 0) == 0:
+                _cid = _chosen["cargo_id"]
                 if self._validate_take_order_feasibility(_cid, items, status_after_query):
                     ok, reason = self._validate_take_order_constraints(
                         _cid, items, status_after_query, constraints, state)
@@ -3546,7 +3782,6 @@ class ModelDecisionService:
             else:
                 decision = {"action": "wait", "params": {"duration_minutes": 60}}
 
-            # 统一经过 reviewer 审核（遵守 95% 阈值）
             decision = self._maybe_review_decision(
                 decision, candidates, state, status_after_query,
                 constraints, current_min, driver_id,
@@ -3557,7 +3792,6 @@ class ModelDecisionService:
                               driver_id, _decision_complexity,
                               self.token_optimizer.suggest_strategy(driver_id, _remaining_steps))
             self._update_state_after_decision(state, decision, current_min, candidates)
-            # Task #7: 记录决策到协调层
             self.coordination_layer.record_decision(
                 driver_id,
                 decision.get("params", {}).get("cargo_id", ""),
@@ -3591,30 +3825,39 @@ class ModelDecisionService:
                             items, state,
                         )
                         if _validated:
-                            # reviewer 建议 wait 最长 60 分钟，跟踪连续 wait
-                            if _validated.get("action") == "wait":
-                                dur = int(_validated.get("params", {}).get("duration_minutes", 30))
-                                if dur > 60:
-                                    _validated["params"]["duration_minutes"] = 60
-                                state.consecutive_review_waits += 1
+                            # Advisory-only: 仅在 reviewer 有量化更优方案时接受否决
+                            if not self._should_accept_reviewer_override(
+                                _validated, _heuristic_proposal, candidates,
+                                state, current_min,
+                            ):
+                                self._logger.info(
+                                    "Reviewer 否决被忽略(无更优方案) driver=%s reason=%s",
+                                    driver_id, _review_result.get("reason", ""),
+                                )
                             else:
-                                state.consecutive_review_waits = 0
-                            state.last_review_reason = _review_result.get("reason", "")
-                            self._logger.info(
-                                "Reviewer 否决启发式 driver=%s action=%s reason=%s consecutive_waits=%d",
-                                driver_id, _validated.get("action"),
-                                _review_result.get("reason", ""),
-                                state.consecutive_review_waits,
-                            )
-                            self._update_state_after_decision(
-                                state, _validated, current_min, candidates
-                            )
-                            self.coordination_layer.record_decision(
-                                driver_id,
-                                _validated.get("params", {}).get("cargo_id", ""),
-                                _validated.get("action", ""),
-                            )
-                            return _validated
+                                if _validated.get("action") == "wait":
+                                    dur = int(_validated.get("params", {}).get("duration_minutes", 30))
+                                    if dur > 60:
+                                        _validated["params"]["duration_minutes"] = 60
+                                    state.consecutive_review_waits += 1
+                                else:
+                                    state.consecutive_review_waits = 0
+                                state.last_review_reason = _review_result.get("reason", "")
+                                self._logger.info(
+                                    "Reviewer 否决启发式 driver=%s action=%s reason=%s consecutive_waits=%d",
+                                    driver_id, _validated.get("action"),
+                                    _review_result.get("reason", ""),
+                                    state.consecutive_review_waits,
+                                )
+                                self._update_state_after_decision(
+                                    state, _validated, current_min, candidates
+                                )
+                                self.coordination_layer.record_decision(
+                                    driver_id,
+                                    _validated.get("params", {}).get("cargo_id", ""),
+                                    _validated.get("action", ""),
+                                )
+                                return _validated
                         else:
                             self._logger.info(
                                 "Reviewer 建议不合法，回退到 LLM/启发式 driver=%s",
@@ -3807,9 +4050,11 @@ class ModelDecisionService:
             "top_candidates": [
                 {
                     "cargo_id": c.get("cargo_id") or c.get("cargo", {}).get("cargo_id"),
-                    "score": c.get("score", 0),
+                    "true_net": c.get("true_net", c.get("score", 0)),
                     "net_profit": c.get("net_profit") or c.get("profit", 0),
                     "deadhead_km": c.get("deadhead_km") or c.get("distance_km", 0),
+                    "has_soft_penalty": c.get("has_soft_penalty", False),
+                    "penalty_cost": c.get("penalty_score", 0),
                     "cost_time_minutes": c.get("cost_time_minutes")
                         or c.get("cargo", {}).get("cost_time_minutes", 0),
                 }
@@ -3906,6 +4151,46 @@ class ModelDecisionService:
             self._logger.warning("Reviewer(快速路径)异常 driver=%s: %s", driver_id, e)
         return decision
 
+    def _should_accept_reviewer_override(
+        self,
+        reviewer_decision: dict,
+        current_decision: dict,
+        candidates: list[dict],
+        state: "StateTracker",
+        current_min: int,
+    ) -> bool:
+        """Reviewer 仅在有量化更优替代方案时才否决。"""
+        reviewer_cargo = reviewer_decision.get("params", {}).get("cargo_id", "")
+        current_cargo = current_decision.get("params", {}).get("cargo_id", "")
+
+        if reviewer_cargo:
+            # Reviewer 建议了另一个货源——检查其 true_net 是否更高
+            rev_cand = next(
+                (c for c in candidates if c.get("cargo_id") == reviewer_cargo), None)
+            cur_cand = next(
+                (c for c in candidates if c.get("cargo_id") == current_cargo), None)
+            if rev_cand and cur_cand:
+                rev_tn = rev_cand.get("true_net", rev_cand.get("score", -9999))
+                cur_tn = cur_cand.get("true_net", cur_cand.get("score", -9999))
+                return rev_tn > cur_tn
+            return reviewer_cargo != current_cargo  # 未知候选，保守接受
+
+        if reviewer_decision.get("action") == "wait":
+            # Reviewer 说等——仅在 true_net < 0 或有紧迫任务时接受
+            cur_cand = next(
+                (c for c in candidates if c.get("cargo_id") == current_cargo), None)
+            cur_tn = cur_cand.get("true_net", cur_cand.get("score", 0)) if cur_cand else 0
+            if cur_tn < 0:
+                return True
+            has_tight_task = hasattr(state, "open_tasks") and any(
+                (t.get("deadline_minute", 0) or 0) - current_min < 360
+                for t in state.open_tasks
+                if t.get("deadline_minute")
+            )
+            return has_tight_task
+
+        return True  # 其他情况（reposition 等）保守接受
+
     def _maybe_review_decision(self, decision: dict, candidates: list[dict],
                                state: StateTracker, status: dict,
                                constraints: list[dict], current_min: int,
@@ -3941,7 +4226,16 @@ class ModelDecisionService:
                     items, state,
                 )
                 if _validated:
-                    # reviewer 建议 wait 最长 60 分钟
+                    # Advisory-only: 仅在 reviewer 有量化更优方案时接受否决
+                    if not self._should_accept_reviewer_override(
+                        _validated, decision, candidates, state, current_min,
+                    ):
+                        self._logger.info(
+                            "Reviewer 否决被忽略(无更优方案) driver=%s reason=%s",
+                            driver_id, _result.get("reason", ""),
+                        )
+                        state.consecutive_review_waits = 0
+                        return decision
                     if _validated.get("action") == "wait":
                         dur = int(_validated.get("params", {}).get("duration_minutes", 30))
                         if dur > 60:
@@ -3958,7 +4252,6 @@ class ModelDecisionService:
                     )
                     return _validated
             else:
-                # reviewer 批准，重置连续 wait 计数
                 state.consecutive_review_waits = 0
         except Exception as e:
             self._logger.warning("DecisionReviewer 异常 driver=%s: %s", driver_id, e)

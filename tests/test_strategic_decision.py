@@ -731,3 +731,226 @@ class TestFuturePositionCost:
         assert result[0]["cargo_id"] == "NEAR_HOME"
         by_id = {item["cargo_id"]: item for item in result}
         assert by_id["NEAR_HOME"]["future_position_cost"] < by_id["FAR_HOME"]["future_position_cost"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# true_net 重构测试
+# ═══════════════════════════════════════════════════════════════
+
+class TestClassifyConstraintSeverity:
+    """classify_constraint_severity 应正确区分硬/软约束。"""
+
+    def test_mandatory_cargo_is_hard(self):
+        assert HeuristicLayer.classify_constraint_severity(
+            {"type": "mandatory_cargo"}) == "hard"
+
+    def test_scheduled_event_is_hard(self):
+        assert HeuristicLayer.classify_constraint_severity(
+            {"type": "scheduled_event"}) == "hard"
+
+    def test_time_restriction_is_hard(self):
+        assert HeuristicLayer.classify_constraint_severity(
+            {"type": "time_restriction"}) == "hard"
+
+    def test_forbidden_circle_is_hard(self):
+        assert HeuristicLayer.classify_constraint_severity(
+            {"type": "spatial_restrict", "params": {"type": "forbidden_circle"}}
+        ) == "hard"
+
+    def test_daily_rest_is_soft(self):
+        assert HeuristicLayer.classify_constraint_severity(
+            {"type": "daily_rest", "severity": "soft"}) == "soft"
+
+    def test_daily_home_deadline_default_is_soft(self):
+        assert HeuristicLayer.classify_constraint_severity(
+            {"type": "daily_home_deadline", "severity": "soft", "penalty_amount": 300}
+        ) == "soft"
+
+    def test_daily_home_deadline_hard_high_penalty_is_hard(self):
+        assert HeuristicLayer.classify_constraint_severity(
+            {"type": "daily_home_deadline", "severity": "hard", "penalty_amount": 9000}
+        ) == "hard"
+
+    def test_daily_home_deadline_hard_low_penalty_is_soft(self):
+        assert HeuristicLayer.classify_constraint_severity(
+            {"type": "daily_home_deadline", "severity": "hard", "penalty_amount": 300}
+        ) == "soft"
+
+    def test_monthly_visit_is_soft(self):
+        assert HeuristicLayer.classify_constraint_severity(
+            {"type": "monthly_visit_requirement"}) == "soft"
+
+    def test_day_off_is_soft(self):
+        assert HeuristicLayer.classify_constraint_severity(
+            {"type": "day_off_requirement"}) == "soft"
+
+
+class TestTrueNetScoring:
+    """score_and_rank 应输出 true_net 字段，且净利润权重为 1.0。"""
+
+    def test_output_has_true_net_field(self):
+        state = StateTracker()
+        layer = HeuristicLayer()
+        status = {"simulation_progress_minutes": 600, "simulation_horizon_minutes": 43200}
+        items = [{
+            "distance_km": 5.0,
+            "cargo": {
+                "cargo_id": "C1", "cargo_name": "general", "price": 500,
+                "cost_time_minutes": 60,
+                "start": {"lat": 23.0, "lng": 113.0},
+                "end": {"lat": 23.5, "lng": 113.5},
+                "load_time": None,
+            },
+        }]
+        result = layer.score_and_rank(items, status, state, [], top_n=1)
+        assert len(result) == 1
+        assert "true_net" in result[0]
+        assert "has_soft_penalty" in result[0]
+        assert "hard_penalty" in result[0]
+        assert "long_order_penalty" in result[0]
+        assert "deadhead_risk_cost" in result[0]
+
+    def test_net_profit_weight_is_one(self):
+        """净利润应以 1.0 权重进入 true_net（不再是 0.25）。"""
+        state = StateTracker()
+        layer = HeuristicLayer()
+        status = {"simulation_progress_minutes": 600, "simulation_horizon_minutes": 43200}
+        # 两个候选，唯一区别是价格
+        items = [
+            {
+                "distance_km": 1.0,
+                "cargo": {
+                    "cargo_id": "LOW", "cargo_name": "general", "price": 200,
+                    "cost_time_minutes": 30,
+                    "start": {"lat": 23.0, "lng": 113.0},
+                    "end": {"lat": 23.01, "lng": 113.01},
+                    "load_time": None,
+                },
+            },
+            {
+                "distance_km": 1.0,
+                "cargo": {
+                    "cargo_id": "HIGH", "cargo_name": "general", "price": 600,
+                    "cost_time_minutes": 30,
+                    "start": {"lat": 23.0, "lng": 113.0},
+                    "end": {"lat": 23.01, "lng": 113.01},
+                    "load_time": None,
+                },
+            },
+        ]
+        result = layer.score_and_rank(items, status, state, [], top_n=2)
+        by_id = {c["cargo_id"]: c for c in result}
+        # HIGH 的 true_net 应比 LOW 高约 400（价格差），差距应远大于旧公式下的 100
+        diff = by_id["HIGH"]["true_net"] - by_id["LOW"]["true_net"]
+        assert diff > 300, f"true_net diff {diff} should reflect full profit difference"
+
+
+class TestDailyRestSoftPenalty:
+    """daily_rest 违反应不再硬拒，而是通过 soft_penalty_cost 惩罚。"""
+
+    def test_daily_rest_no_longer_hard_rejects(self):
+        """score_and_rank 不应因 daily_rest 过滤掉候选。"""
+        state = StateTracker()
+        layer = HeuristicLayer()
+        # 当天已过 20 小时，只剩 4 小时，需要 5 小时连续休息
+        status = {"simulation_progress_minutes": 20 * 60, "simulation_horizon_minutes": 43200}
+        constraints = [{
+            "type": "daily_rest",
+            "severity": "soft",
+            "params": {"min_continuous_minutes": 300},
+            "penalty_amount": 300,
+        }]
+        items = [{
+            "distance_km": 1.0,
+            "cargo": {
+                "cargo_id": "LATE", "cargo_name": "general", "price": 800,
+                "cost_time_minutes": 120,
+                "start": {"lat": 23.0, "lng": 113.0},
+                "end": {"lat": 23.5, "lng": 113.5},
+                "load_time": None,
+            },
+        }]
+        result = layer.score_and_rank(items, status, state, constraints, top_n=5)
+        # 以前会被过滤掉（返回空），现在应保留
+        assert len(result) == 1
+        assert result[0]["has_soft_penalty"] is True
+        assert result[0]["penalty_score"] > 0
+
+
+class TestSelectBestByTrueNet:
+    """_select_best_by_true_net 应正确应用 penalty_margin 决策规则。"""
+
+    def test_safe_chosen_when_penalty_not_better_enough(self):
+        candidates = [
+            {"cargo_id": "SAFE", "score": 100, "true_net": 100,
+             "has_soft_penalty": False, "hard_penalty": 0,
+             "total_minutes": 60, "deadhead_km": 10},
+            {"cargo_id": "PENALTY", "score": 250, "true_net": 250,
+             "has_soft_penalty": True, "hard_penalty": 0,
+             "total_minutes": 60, "deadhead_km": 10},
+        ]
+        # PENALTY true_net (250) > SAFE true_net (100) + margin (200) = 300? No (250 < 300)
+        best = ModelDecisionService._select_best_by_true_net(candidates)
+        assert best["cargo_id"] == "SAFE"
+
+    def test_penalty_chosen_when_better_enough(self):
+        candidates = [
+            {"cargo_id": "SAFE", "score": 100, "true_net": 100,
+             "has_soft_penalty": False, "hard_penalty": 0,
+             "total_minutes": 60, "deadhead_km": 10},
+            {"cargo_id": "PENALTY", "score": 400, "true_net": 400,
+             "has_soft_penalty": True, "hard_penalty": 0,
+             "total_minutes": 60, "deadhead_km": 10},
+        ]
+        # PENALTY true_net (400) > SAFE true_net (100) + margin (200) = 300? Yes
+        best = ModelDecisionService._select_best_by_true_net(candidates)
+        assert best["cargo_id"] == "PENALTY"
+
+    def test_extreme_deadhead_rejected(self):
+        candidates = [
+            {"cargo_id": "FAR", "score": 500, "true_net": 500,
+             "has_soft_penalty": False, "hard_penalty": 0,
+             "total_minutes": 60, "deadhead_km": 200},
+        ]
+        # deadhead 200 > 150, true_net 500 < 800 → reject
+        best = ModelDecisionService._select_best_by_true_net(candidates)
+        assert best is None
+
+    def test_extreme_deadhead_accepted_with_high_true_net(self):
+        candidates = [
+            {"cargo_id": "FAR_BUT_RICH", "score": 900, "true_net": 900,
+             "has_soft_penalty": False, "hard_penalty": 0,
+             "total_minutes": 60, "deadhead_km": 200},
+        ]
+        # deadhead 200 > 150, but true_net 900 > 800 → accept
+        best = ModelDecisionService._select_best_by_true_net(candidates)
+        assert best is not None
+        assert best["cargo_id"] == "FAR_BUT_RICH"
+
+    def test_empty_candidates_returns_none(self):
+        assert ModelDecisionService._select_best_by_true_net([]) is None
+
+
+class TestEstimateWaitValue:
+    """estimate_wait_value 应返回合理的等待价值。"""
+
+    def test_wait_value_with_rest_need(self):
+        state = StateTracker()
+        constraints = [{
+            "type": "daily_rest",
+            "severity": "soft",
+            "params": {"min_continuous_minutes": 300},
+            "penalty_amount": 300,
+        }]
+        # 尚未满足休息要求 → rest_value 应使 wait_value 为正
+        val = HeuristicLayer.estimate_wait_value(
+            600, state, constraints, 43200)
+        assert val > 0, "需要休息时 wait_value 应为正"
+
+    def test_wait_value_at_night(self):
+        state = StateTracker()
+        # 深夜 23:00，无休息需求
+        val = HeuristicLayer.estimate_wait_value(
+            23 * 60, state, [], 43200)
+        # 应为负（夜间无货，时间成本 + 夜间惩罚）
+        assert val < 0, "深夜无需求时 wait_value 应为负"
