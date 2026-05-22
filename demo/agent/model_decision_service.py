@@ -2903,59 +2903,63 @@ class ModelDecisionService:
                 deadline_hour = 23
             day_index = current_min // 1440
             today_deadline = day_index * 1440 + deadline_hour * 60
-            # 如果完单已经超过今天 deadline，检查明天
-            if finish_min > today_deadline:
-                today_deadline += 1440
             travel_home_min = _distance_to_minutes(
                 haversine(end_lat, end_lng, float(home_lat), float(home_lng))
             )
             if finish_min + travel_home_min > today_deadline:
                 return False, "cannot_return_home_before_deadline"
 
-        # 7. scheduled_event：不能跨过事件时间窗
-        for c in constraints:
-            if c.get("type") != "scheduled_event":
-                continue
-            p = c.get("params", {})
-            pickup_min = _to_int_or_zero(p.get("pickup_min"))
-            home_deadline = _to_int_or_zero(p.get("home_deadline_min"))
-            release_min = _to_int_or_zero(p.get("release_min"))
-            event_lat = p.get("pickup_lat")
-            event_lng = p.get("pickup_lng")
-            if event_lat is None or event_lng is None:
-                continue
-            # 如果接单会跨过 pickup_min，且终点离事件点远，拒绝
-            if pickup_min > 0 and finish_min > pickup_min:
-                travel_to_event = _distance_to_minutes(
-                    haversine(end_lat, end_lng, float(event_lat), float(event_lng))
-                )
-                if finish_min + travel_to_event > pickup_min + 120:
-                    return False, "order_crosses_event_pickup_window"
-            # 如果接单会跨过 home_deadline，且终点离家远
-            home_lat_c = p.get("home_lat")
-            home_lng_c = p.get("home_lng")
-            if home_deadline > 0 and finish_min > home_deadline and home_lat_c and home_lng_c:
-                travel_home = _distance_to_minutes(
-                    haversine(end_lat, end_lng, float(home_lat_c), float(home_lng_c))
-                )
-                if finish_min + travel_home > home_deadline:
-                    return False, "order_crosses_event_home_deadline"
+        # 7. scheduled_event：不能跨过事件时间窗（仅检查未完成的 open task）
+        _has_open_scheduled_event = any(
+            t.get("type") == "scheduled_event" for t in state.open_tasks
+        )
+        if _has_open_scheduled_event:
+            for c in constraints:
+                if c.get("type") != "scheduled_event":
+                    continue
+                p = c.get("params", {})
+                pickup_min = _to_int_or_zero(p.get("pickup_min"))
+                home_deadline = _to_int_or_zero(p.get("home_deadline_min"))
+                event_lat = p.get("pickup_lat")
+                event_lng = p.get("pickup_lng")
+                if event_lat is None or event_lng is None:
+                    continue
+                # 如果接单会跨过 pickup_min，且终点离事件点远，拒绝
+                if pickup_min > 0 and finish_min > pickup_min:
+                    travel_to_event = _distance_to_minutes(
+                        haversine(end_lat, end_lng, float(event_lat), float(event_lng))
+                    )
+                    if finish_min + travel_to_event > pickup_min + 120:
+                        return False, "order_crosses_event_pickup_window"
+                # 如果接单会跨过 home_deadline，且终点离家远
+                home_lat_c = p.get("home_lat")
+                home_lng_c = p.get("home_lng")
+                if home_deadline > 0 and finish_min > home_deadline and home_lat_c and home_lng_c:
+                    travel_home = _distance_to_minutes(
+                        haversine(end_lat, end_lng, float(home_lat_c), float(home_lng_c))
+                    )
+                    if finish_min + travel_home > home_deadline:
+                        return False, "order_crosses_event_home_deadline"
 
-        # 8. monthly_visit：完单后能到达到访点（当天内）
-        for c in constraints:
-            if c.get("type") != "monthly_visit_requirement":
-                continue
-            p = c.get("params", {})
-            visit_lat = p.get("target_lat")
-            visit_lng = p.get("target_lng")
-            if visit_lat is None or visit_lng is None:
-                continue
-            travel_to_visit = _distance_to_minutes(
-                haversine(end_lat, end_lng, float(visit_lat), float(visit_lng))
-            )
-            day_end = ((current_min // 1440) + 1) * 1440
-            if finish_min + travel_to_visit > day_end:
-                return False, "cannot_reach_visit_point_today"
+        # 8. monthly_visit：完单后能到达到访点（仅检查未完成的 open task）
+        _has_open_visit = any(
+            t.get("type") == "monthly_visit" for t in state.open_tasks
+        )
+        if _has_open_visit:
+            for c in constraints:
+                if c.get("type") != "monthly_visit_requirement":
+                    continue
+                p = c.get("params", {})
+                visit_lat = p.get("target_lat")
+                visit_lng = p.get("target_lng")
+                if visit_lat is None or visit_lng is None:
+                    continue
+                travel_to_visit = _distance_to_minutes(
+                    haversine(end_lat, end_lng, float(visit_lat), float(visit_lng))
+                )
+                day_end = ((current_min // 1440) + 1) * 1440
+                if finish_min + travel_to_visit > day_end:
+                    return False, "cannot_reach_visit_point_today"
 
         return True, ""
 
@@ -3255,7 +3259,7 @@ class ModelDecisionService:
                     decision = self._maybe_review_decision(
                         decision, candidates, state, status_after_query,
                         constraints, current_min, driver_id,
-                        _decision_complexity, _remaining_steps,
+                        _decision_complexity, _remaining_steps, items,
                     )
                     self._logger.info("快速接单(token降级) driver=%s cargo=%s",
                                       driver_id, decision.get("params", {}).get("cargo_id", ""))
@@ -3283,7 +3287,7 @@ class ModelDecisionService:
             decision = self._maybe_review_decision(
                 decision, candidates, state, status_after_query,
                 constraints, current_min, driver_id,
-                _decision_complexity, _remaining_steps,
+                _decision_complexity, _remaining_steps, items,
             )
             self._update_state_after_decision(state, decision, current_min, candidates)
             return decision
@@ -3311,7 +3315,7 @@ class ModelDecisionService:
             decision = self._maybe_review_decision(
                 decision, candidates, state, status_after_query,
                 constraints, current_min, driver_id,
-                _decision_complexity, _remaining_steps,
+                _decision_complexity, _remaining_steps, items,
             )
 
             self._logger.info("Token智能分配跳过LLM driver=%s complexity=%s strategy=%s",
@@ -3348,7 +3352,8 @@ class ModelDecisionService:
                     if not _review_result.get("approve", True):
                         _reviewer_decision = self._convert_review_to_decision(_review_result)
                         _validated = self._validate_reviewer_decision(
-                            _reviewer_decision, candidates, status_after_query, constraints
+                            _reviewer_decision, candidates, status_after_query, constraints,
+                            items, state,
                         )
                         if _validated:
                             # reviewer 建议 wait 最长 60 分钟，跟踪连续 wait
@@ -3606,7 +3611,9 @@ class ModelDecisionService:
         return {"action": action, "params": params}
 
     def _validate_reviewer_decision(self, decision: dict, candidates: list[dict],
-                                    status: dict, constraints: list[dict]) -> dict | None:
+                                    status: dict, constraints: list[dict],
+                                    items: list[dict] | None = None,
+                                    state: "StateTracker | None" = None) -> dict | None:
         """校验 reviewer 产生的动作，与 _validate_action 同等标准"""
         validated = self._validate_action(decision, status, constraints)
         if validated and validated.get("action") == "take_order":
@@ -3618,6 +3625,14 @@ class ModelDecisionService:
                     valid_ids.add(str(cid))
             if cargo_id not in valid_ids:
                 return None  # cargo_id 不在可见候选中，安全拒绝
+            # 综合硬校验：空间约束、回家 deadline、家事窗口等
+            if items is not None and state is not None:
+                ok, reason = self._validate_take_order_constraints(
+                    cargo_id, items, status, constraints, state)
+                if not ok:
+                    self._logger.info("Reviewer take_order 约束校验失败 cargo=%s reason=%s",
+                                      cargo_id, reason)
+                    return None
         return validated
 
     def _try_reviewer_override(self, decision: dict, candidates: list[dict],
@@ -3659,7 +3674,8 @@ class ModelDecisionService:
                                constraints: list[dict], current_min: int,
                                driver_id: str,
                                decision_complexity: str = "low",
-                               remaining_steps: int = 100) -> dict:
+                               remaining_steps: int = 100,
+                               items: list[dict] | None = None) -> dict:
         """统一的 reviewer 审核入口，所有决策路径都应经过此方法。
         遵守 token_optimizer 的 95% 阈值：接近预算时仍允许审核。
         连续 wait >= 3 次时暂停审核 180 分钟。"""
@@ -3685,6 +3701,7 @@ class ModelDecisionService:
                 _reviewer_dec = self._convert_review_to_decision(_result)
                 _validated = self._validate_reviewer_decision(
                     _reviewer_dec, candidates, status, constraints,
+                    items, state,
                 )
                 if _validated:
                     # reviewer 建议 wait 最长 60 分钟

@@ -200,9 +200,8 @@ class StrategicPlanner:
 
         # 用白名单替换 LLM 幻觉的 must_do_tasks
         plan["must_do_tasks"] = allowed_tasks
-        # home_or_visit_plan 只保留来自 constraints 的条目
-        if allowed_home_plans:
-            plan["home_or_visit_plan"] = allowed_home_plans
+        # 无条件覆盖 home_or_visit_plan，清除 LLM 幻觉的回家/到访计划
+        plan["home_or_visit_plan"] = allowed_home_plans
 
         return plan
 
