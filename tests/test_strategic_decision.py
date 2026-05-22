@@ -11,6 +11,7 @@
 import sys
 import os
 import types
+import importlib
 
 import pytest
 
@@ -20,13 +21,10 @@ DEMO_DIR = os.path.join(PROJECT_ROOT, "demo")
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, DEMO_DIR)
 
-# mock simkit if not installed (or not fully mocked)
-_needs_mock = (
-    "simkit" not in sys.modules
-    or not hasattr(sys.modules.get("simkit"), "__path__")
-    or "simkit.ports" not in sys.modules
-)
-if _needs_mock:
+# mock simkit only when the real demo package is unavailable.
+try:
+    importlib.import_module("simkit.ports")
+except ModuleNotFoundError:
     _simkit = types.ModuleType("simkit")
     _simkit.__path__ = []  # make it a package so sub-module imports work
     _simkit.__package__ = "simkit"
@@ -651,3 +649,57 @@ class TestTakeOrderConstraintValidation:
 
         assert ok is False
         assert reason == "violates_time_restriction"
+
+
+class TestFuturePositionCost:
+    """Heuristic scoring should price the position needed after an order."""
+
+    def test_home_deadline_prefers_order_ending_near_home(self):
+        state = StateTracker()
+        layer = HeuristicLayer()
+        status = {
+            "simulation_progress_minutes": 18 * 60,
+            "simulation_horizon_minutes": 1440,
+        }
+        constraints = [{
+            "type": "daily_home_deadline",
+            "params": {
+                "home_lat": 23.12,
+                "home_lng": 113.28,
+                "deadline_hour": 23,
+            },
+            "penalty_amount": 900,
+            "severity": "hard",
+        }]
+        items = [
+            {
+                "distance_km": 1.0,
+                "cargo": {
+                    "cargo_id": "FAR_HOME",
+                    "cargo_name": "general",
+                    "price": 500,
+                    "cost_time_minutes": 60,
+                    "start": {"lat": 23.0, "lng": 113.0},
+                    "end": {"lat": 22.0, "lng": 114.5},
+                    "load_time": None,
+                },
+            },
+            {
+                "distance_km": 1.0,
+                "cargo": {
+                    "cargo_id": "NEAR_HOME",
+                    "cargo_name": "general",
+                    "price": 500,
+                    "cost_time_minutes": 60,
+                    "start": {"lat": 23.0, "lng": 113.0},
+                    "end": {"lat": 23.12, "lng": 113.28},
+                    "load_time": None,
+                },
+            },
+        ]
+
+        result = layer.score_and_rank(items, status, state, constraints, top_n=2)
+
+        assert result[0]["cargo_id"] == "NEAR_HOME"
+        by_id = {item["cargo_id"]: item for item in result}
+        assert by_id["NEAR_HOME"]["future_position_cost"] < by_id["FAR_HOME"]["future_position_cost"]

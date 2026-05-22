@@ -1949,6 +1949,126 @@ class HeuristicLayer:
         return min(cluster_value, 80.0)  # 封顶80
 
     @staticmethod
+    def _urgency_weight(slack_minutes: int) -> float:
+        if slack_minutes < 0:
+            return 8.0
+        if slack_minutes <= 180:
+            return 4.0
+        if slack_minutes <= 720:
+            return 2.0
+        if slack_minutes <= 1440:
+            return 1.0
+        return 0.25
+
+    def _target_position_cost(
+        self,
+        end_lat: float,
+        end_lng: float,
+        target_lat: float,
+        target_lng: float,
+        finish_min: int,
+        deadline_min: int,
+        penalty_amount: float = 0.0,
+    ) -> float:
+        dist = haversine(end_lat, end_lng, target_lat, target_lng)
+        travel_min = _distance_to_minutes(dist)
+        slack = deadline_min - finish_min - travel_min
+        move_cost = dist * self.cost_per_km + travel_min * 0.4
+        cost = move_cost * self._urgency_weight(slack)
+        if slack < 0:
+            cost += penalty_amount
+        return cost
+
+    def _future_position_cost(
+        self,
+        end_lat: float,
+        end_lng: float,
+        finish_min: int,
+        constraints: list[dict],
+        state: StateTracker,
+        horizon: int,
+        mandatory_pickups: list[dict],
+    ) -> float:
+        cost = 0.0
+        current_day = _get_day_index(finish_min)
+        day_end = (current_day + 1) * 1440
+
+        for c in constraints:
+            ctype = c.get("type")
+            p = c.get("params", {})
+            penalty_amount = float(c.get("penalty_amount", 0) or 0)
+
+            if ctype == "daily_home_deadline":
+                home_lat = p.get("home_lat")
+                home_lng = p.get("home_lng")
+                if home_lat is None or home_lng is None:
+                    continue
+                try:
+                    deadline_hour = int(p.get("deadline_hour", 23))
+                    deadline_min = current_day * 1440 + deadline_hour * 60
+                    cost += self._target_position_cost(
+                        end_lat, end_lng, float(home_lat), float(home_lng),
+                        finish_min, deadline_min, penalty_amount,
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+            elif ctype == "scheduled_event":
+                has_open_event = any(t.get("type") == "scheduled_event" for t in state.open_tasks)
+                if not has_open_event:
+                    continue
+                pickup_lat = p.get("pickup_lat")
+                pickup_lng = p.get("pickup_lng")
+                home_lat = p.get("home_lat")
+                home_lng = p.get("home_lng")
+                pickup_min = _to_int_or_zero(p.get("pickup_min"))
+                home_deadline = _to_int_or_zero(p.get("home_deadline_min"))
+                release_min = _to_int_or_zero(p.get("release_min"))
+                if pickup_lat is not None and pickup_lng is not None and pickup_min > finish_min:
+                    if pickup_min - finish_min <= 2 * 1440:
+                        cost += self._target_position_cost(
+                            end_lat, end_lng, float(pickup_lat), float(pickup_lng),
+                            finish_min, pickup_min, penalty_amount,
+                        )
+                if home_lat is not None and home_lng is not None:
+                    target_deadline = home_deadline if home_deadline > finish_min else release_min
+                    if target_deadline > finish_min and target_deadline - finish_min <= 2 * 1440:
+                        cost += self._target_position_cost(
+                            end_lat, end_lng, float(home_lat), float(home_lng),
+                            finish_min, target_deadline, penalty_amount,
+                        )
+
+            elif ctype == "monthly_visit_requirement":
+                has_open_visit = any(t.get("type") == "monthly_visit" for t in state.open_tasks)
+                if not has_open_visit:
+                    continue
+                target_lat = p.get("target_lat")
+                target_lng = p.get("target_lng")
+                if target_lat is None or target_lng is None:
+                    continue
+                days_left = max(1, math.ceil(max(0, horizon - finish_min) / 1440))
+                try:
+                    required = int(p.get("min_visit_days", 1))
+                except (TypeError, ValueError):
+                    required = 1
+                deadline = day_end if days_left <= required + 1 else min(horizon, finish_min + 1440)
+                cost += self._target_position_cost(
+                    end_lat, end_lng, float(target_lat), float(target_lng),
+                    finish_min, deadline, penalty_amount,
+                ) * (1.5 if days_left <= required + 1 else 0.35)
+
+        for mp in mandatory_pickups:
+            activation = int(mp.get("activation_min", 0))
+            if activation <= finish_min or activation - finish_min > 2 * 1440:
+                continue
+            cost += self._target_position_cost(
+                end_lat, end_lng, float(mp["pickup_lat"]), float(mp["pickup_lng"]),
+                finish_min, int(mp.get("window_end", activation)), 0.0,
+            )
+
+        return cost
+
+    @staticmethod
     def _build_mandatory_pickup_info(
         state: StateTracker, constraints: list[dict],
         items: list[dict] | None = None,
@@ -2182,11 +2302,23 @@ class HeuristicLayer:
                 if distance_km > remaining_quota:
                     deadhead_penalty += max(0.0, distance_km - remaining_quota) * 10.0
 
+            finish_min = current_min + total_time
+            future_position_cost = self._future_position_cost(
+                end_lat,
+                end_lng,
+                finish_min,
+                constraints,
+                state,
+                horizon,
+                mandatory_pickups,
+            )
+
             # 新综合评分公式（Task #2）
             score = (
                 time_efficiency * 60 * time_phase_multiplier
                 - penalty_score * 2.0 * (1 + preference_impact)
                 - deadhead_penalty
+                - future_position_cost
                 + cluster_value
                 + net_profit * 0.15
                 + scarcity_factor
@@ -2203,6 +2335,7 @@ class HeuristicLayer:
                 "total_minutes": total_minutes,
                 "time_efficiency": round(time_efficiency, 4),
                 "penalty_score": round(penalty_score, 2),
+                "future_position_cost": round(future_position_cost, 2),
                 "score": round(score, 4),
                 "start": {"lat": start_lat, "lng": start_lng},
                 "end": {"lat": end_lat, "lng": end_lng},
@@ -2289,6 +2422,7 @@ class LLMLayer:
                 "总耗时分钟": c["total_minutes"],
                 "时间效率": c["time_efficiency"],
                 "违规罚款": c["penalty_score"],
+                "未来位置成本": c.get("future_position_cost", 0),
                 "评分": c["score"],
             })
 

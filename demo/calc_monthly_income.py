@@ -26,6 +26,7 @@ from simkit.simulation_actions import haversine_km
 
 
 _SIMULATION_EPOCH = datetime(2026, 3, 1, 0, 0, 0)
+_FULL_MONTH_EVAL_DAYS = 30
 
 # --- 地理与时间常量（与 drivers.json 描述一致）---
 SHENZHEN_LAT_MIN = 22.42
@@ -348,6 +349,25 @@ def _calendar_weekday_202603(day_idx: int) -> int:
     return (base + timedelta(days=day_idx)).weekday()
 
 
+def _simulation_horizon_minutes(days: int) -> int:
+    return max(0, int(days) * 1440)
+
+
+def _is_full_month_evaluation(days: int) -> bool:
+    return int(days) >= _FULL_MONTH_EVAL_DAYS
+
+
+def _deferred_future_event(rule: str, window_end_minute: int, horizon_minutes: int, spec: PreferenceRuleSpec) -> dict[str, Any]:
+    return {
+        "rule": rule,
+        "window_end_minute": window_end_minute,
+        "horizon_minutes": horizon_minutes,
+        "deferred_until_window_end": True,
+        "penalty": 0.0,
+        "preference_text": spec.content,
+    }
+
+
 def _build_step_contexts(file_path: Path) -> list[dict[str, Any]]:
     ctxs: list[dict[str, Any]] = []
     prev_end_minutes = 0
@@ -488,9 +508,16 @@ class DriverD002PreferenceCalculator(DriverPreferenceCalculatorBase):
                     break
             if not took_accepted:
                 free_days += 1
-        pen0 = 0.0 if free_days >= 4 else (r0.penalty_cap or r0.penalty_amount)
-        total += pen0
+        monthly_deferred = not _is_full_month_evaluation(simulation_duration_days)
+        if monthly_deferred:
+            pen0 = 0.0
+        else:
+            pen0 = 0.0 if free_days >= 4 else (r0.penalty_cap or r0.penalty_amount)
+            total += pen0
         detail_rules.append({"rule": "自然月至少4整天无成交接单（空驶不计）", "free_days": free_days, "penalty": round(pen0, 2), "preference_text": r0.content})
+
+        if monthly_deferred:
+            detail_rules[-1].update({"required": 4, "deferred_until_full_month": True})
 
         veg_orders = 0
         for c in ctxs:
@@ -734,9 +761,16 @@ class DriverD006PreferenceCalculator(DriverPreferenceCalculatorBase):
 
         active = _active_minutes_by_day(ctxs, days)
         off_days = sum(1 for d in days if active.get(d, 0) == 0)
-        pen3 = 0.0 if off_days >= 2 else (r3.penalty_cap or r3.penalty_amount)
-        total += pen3
+        monthly_deferred = not _is_full_month_evaluation(simulation_duration_days)
+        if monthly_deferred:
+            pen3 = 0.0
+        else:
+            pen3 = 0.0 if off_days >= 2 else (r3.penalty_cap or r3.penalty_amount)
+            total += pen3
         detail_rules.append({"rule": "每月至少2整天不接单且不外跑", "off_days": off_days, "penalty": round(pen3, 2), "preference_text": r3.content})
+
+        if monthly_deferred:
+            detail_rules[-1].update({"required": 2, "deferred_until_full_month": True})
 
         return round(total, 2), {"rules": detail_rules}
 
@@ -811,9 +845,16 @@ class DriverD007PreferenceCalculator(DriverPreferenceCalculatorBase):
                     break
             if not ordered:
                 free_full_days += 1
-        pen3 = 0.0 if free_full_days >= 1 else (r3.penalty_cap or r3.penalty_amount)
-        total += pen3
+        monthly_deferred = not _is_full_month_evaluation(simulation_duration_days)
+        if monthly_deferred:
+            pen3 = 0.0
+        else:
+            pen3 = 0.0 if free_full_days >= 1 else (r3.penalty_cap or r3.penalty_amount)
+            total += pen3
         detail_rules.append({"rule": "自然月至少放空一整天不接单", "free_days": free_full_days, "penalty": round(pen3, 2), "preference_text": r3.content})
+
+        if monthly_deferred:
+            detail_rules[-1].update({"required": 1, "deferred_until_full_month": True})
 
         return round(total, 2), {"rules": detail_rules}
 
@@ -835,9 +876,16 @@ class DriverD008PreferenceCalculator(DriverPreferenceCalculatorBase):
 
         active = _active_minutes_by_day(ctxs, days)
         off_days = sum(1 for d in days if active.get(d, 0) == 0)
-        pen0 = 0.0 if off_days >= 2 else (r0.penalty_cap or r0.penalty_amount)
-        total += pen0
+        monthly_deferred = not _is_full_month_evaluation(simulation_duration_days)
+        if monthly_deferred:
+            pen0 = 0.0
+        else:
+            pen0 = 0.0 if off_days >= 2 else (r0.penalty_cap or r0.penalty_amount)
+            total += pen0
         detail_rules.append({"rule": "自然月至少2天完全歇着", "off_days": off_days, "penalty": round(pen0, 2), "preference_text": r0.content})
+
+        if monthly_deferred:
+            detail_rules[-1].update({"required": 2, "deferred_until_full_month": True})
 
         weekday_viol = 0
         for day in days:
@@ -904,9 +952,17 @@ class DriverD009PreferenceCalculator(DriverPreferenceCalculatorBase):
             if _interval_overlap(temp_rule.start_minutes, temp_rule.end_minutes + 1, c["action_start"], c["action_end"]):
                 took_temp = True
                 break
-        pen_temp = 0.0 if took_temp else min(temp_rule.penalty_amount, temp_rule.penalty_cap or float("inf"))
-        total += pen_temp
+        horizon_minutes = _simulation_horizon_minutes(simulation_duration_days)
+        event_deferred = horizon_minutes < temp_rule.end_minutes and not took_temp
+        if event_deferred:
+            pen_temp = 0.0
+        else:
+            pen_temp = 0.0 if took_temp else min(temp_rule.penalty_amount, temp_rule.penalty_cap or float("inf"))
+            total += pen_temp
         detail_rules.append({"rule": "临时约定熟货240646", "satisfied": took_temp, "penalty": round(pen_temp, 2), "preference_text": temp_rule.content})
+
+        if event_deferred:
+            detail_rules[-1].update({"window_end_minute": temp_rule.end_minutes, "horizon_minutes": horizon_minutes, "deferred_until_window_end": True})
 
         r_home = rules[1]
         home_lat, home_lng = 23.12, 113.28
@@ -967,18 +1023,34 @@ class DriverD010PreferenceCalculator(DriverPreferenceCalculatorBase):
         days = list(range(simulation_duration_days))
         family_rule = rules[0]
 
-        pen_family, family_detail = self._evaluate_family_event(ctxs, family_rule)
-        total += pen_family
-        detail_rules.append({**family_detail, "preference_text": family_rule.content})
+        horizon_minutes = _simulation_horizon_minutes(simulation_duration_days)
+        if horizon_minutes < family_rule.end_minutes:
+            detail_rules.append(_deferred_future_event(
+                "家事临时约定(3/10-3/13)",
+                family_rule.end_minutes,
+                horizon_minutes,
+                family_rule,
+            ))
+        else:
+            pen_family, family_detail = self._evaluate_family_event(ctxs, family_rule)
+            total += pen_family
+            detail_rules.append({**family_detail, "preference_text": family_rule.content})
 
         r_visit = rules[1]
         visit_days: set[int] = set()
         for c in ctxs:
             if haversine_km(c["after_lat"], c["after_lng"], 23.13, 113.26) <= 1.0:
                 visit_days.add(c["step_end"] // 1440)
-        pen_visit = 0.0 if len(visit_days) >= 5 else (r_visit.penalty_cap or r_visit.penalty_amount)
-        total += pen_visit
+        monthly_deferred = not _is_full_month_evaluation(simulation_duration_days)
+        if monthly_deferred:
+            pen_visit = 0.0
+        else:
+            pen_visit = 0.0 if len(visit_days) >= 5 else (r_visit.penalty_cap or r_visit.penalty_amount)
+            total += pen_visit
         detail_rules.append({"rule": "月度至少5日到访指定点半径1km", "visit_days": len(visit_days), "penalty": round(pen_visit, 2), "preference_text": r_visit.content})
+
+        if monthly_deferred:
+            detail_rules[-1].update({"required": 5, "deferred_until_full_month": True})
 
         r_rest = rules[2]
         viol_rest = 0
