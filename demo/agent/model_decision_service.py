@@ -100,6 +100,33 @@ def _iter_days_touched(start_min: int, end_min: int) -> range:
     return range(_get_day_index(start_min), _get_day_index(end_min - 1) + 1)
 
 
+def _violates_time_restriction(start_min: int, end_min: int, constraints: list[dict]) -> bool:
+    for c in constraints:
+        if c.get("type") != "time_restriction":
+            continue
+        params = c.get("params", {})
+        if "take_order" not in params.get("forbidden_actions", ["take_order", "reposition"]):
+            continue
+        start_h = params.get("start_hour")
+        end_h = params.get("end_hour")
+        if start_h is None or end_h is None:
+            continue
+        for day in _iter_days_touched(start_min, end_min):
+            forbidden_start = day * 1440 + int(float(start_h) * 60)
+            if float(start_h) <= float(end_h):
+                forbidden_end = day * 1440 + int(float(end_h) * 60)
+                windows = [(forbidden_start, forbidden_end)]
+            else:
+                windows = [
+                    (forbidden_start, (day + 1) * 1440),
+                    (day * 1440, day * 1440 + int(float(end_h) * 60)),
+                ]
+            for a, b in windows:
+                if start_min < b and end_min > a:
+                    return True
+    return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MonthlyConstraintPlanner - 月度偏好约束前置规划器 (Task #1)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2054,7 +2081,7 @@ class HeuristicLayer:
             total_time = deadhead_min + wait_for_load_min + cost_time
             if total_time > remaining:
                 continue
-            if self._violates_time_restriction(current_min, current_min + total_time, constraints):
+            if _violates_time_restriction(current_min, current_min + total_time, constraints):
                 continue
 
             # 过滤: 候选完成后赶不到 mandatory_cargo pickup 的订单
@@ -2206,30 +2233,7 @@ class HeuristicLayer:
 
     @staticmethod
     def _violates_time_restriction(start_min: int, end_min: int, constraints: list[dict]) -> bool:
-        for c in constraints:
-            if c.get("type") != "time_restriction":
-                continue
-            params = c.get("params", {})
-            if "take_order" not in params.get("forbidden_actions", ["take_order", "reposition"]):
-                continue
-            start_h = params.get("start_hour")
-            end_h = params.get("end_hour")
-            if start_h is None or end_h is None:
-                continue
-            for day in _iter_days_touched(start_min, end_min):
-                forbidden_start = day * 1440 + int(float(start_h) * 60)
-                if float(start_h) <= float(end_h):
-                    forbidden_end = day * 1440 + int(float(end_h) * 60)
-                    windows = [(forbidden_start, forbidden_end)]
-                else:
-                    windows = [
-                        (forbidden_start, (day + 1) * 1440),
-                        (day * 1440, day * 1440 + int(float(end_h) * 60)),
-                    ]
-                for a, b in windows:
-                    if start_min < b and end_min > a:
-                        return True
-        return False
+        return _violates_time_restriction(start_min, end_min, constraints)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2905,7 +2909,7 @@ class ModelDecisionService:
                 return False, "deadhead_distance_exceeded"
 
         # 5. time_restriction：执行区间不能穿过禁止时段
-        if self._violates_time_restriction(current_min, finish_min, constraints):
+        if _violates_time_restriction(current_min, finish_min, constraints):
             return False, "violates_time_restriction"
 
         # 6. daily_home_deadline：完单后必须能回家

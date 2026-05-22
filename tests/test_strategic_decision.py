@@ -38,6 +38,7 @@ if _needs_mock:
     sys.modules["simkit.ports"] = _ports
 
 from agent.model_decision_service import (
+    ModelDecisionService,
     StateTracker,
     MonthlyConstraintPlanner,
     HeuristicLayer,
@@ -601,3 +602,52 @@ class TestScheduledEventConservativeCompletion:
         # None → 0, effective_deadline=0, 不会触发 time guard
         # 但没有历史证据，所以不应完成
         assert len(state.open_tasks) == 1
+
+
+class TestTakeOrderConstraintValidation:
+    """覆盖 ModelDecisionService 的硬接单校验主路径。"""
+
+    def _make_service(self):
+        api = type("FakeApi", (), {
+            "model_chat_completion": lambda self, *a, **kw: {},
+        })()
+        return ModelDecisionService(api)
+
+    def _make_items(self, cost_time_minutes=60):
+        return [{
+            "distance_km": 5.0,
+            "cargo": {
+                "cargo_id": "C1",
+                "price": 500,
+                "cost_time_minutes": cost_time_minutes,
+                "start": {"lat": 22.5, "lng": 114.0},
+                "end": {"lat": 22.6, "lng": 114.1},
+                "load_time": ["2026-03-01 10:00:00", "2026-03-01 23:00:00"],
+            },
+        }]
+
+    def test_take_order_constraint_validation_uses_shared_time_restriction(self):
+        """带 time_restriction 时不应因找不到方法而退化成全局 wait。"""
+        svc = self._make_service()
+        state = StateTracker()
+        status = {
+            "simulation_progress_minutes": 700,
+            "simulation_horizon_minutes": 1440,
+            "current_lat": 22.5,
+            "current_lng": 114.0,
+        }
+        constraints = [{
+            "type": "time_restriction",
+            "params": {
+                "start_hour": 12,
+                "end_hour": 13,
+                "forbidden_actions": ["take_order", "reposition"],
+            },
+        }]
+
+        ok, reason = svc._validate_take_order_constraints(
+            "C1", self._make_items(cost_time_minutes=120), status, constraints, state
+        )
+
+        assert ok is False
+        assert reason == "violates_time_restriction"
