@@ -308,7 +308,7 @@ class SimulationOrchestrator:
 
     def _normalize_for_output(self, value: Any) -> Any:
         if isinstance(value, float):
-            return round(value, 2)
+            return round(value, 6)
         if isinstance(value, list):
             return [self._normalize_for_output(item) for item in value]
         if isinstance(value, dict):

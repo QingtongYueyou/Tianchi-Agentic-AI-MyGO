@@ -64,14 +64,14 @@ def _distance_to_minutes(distance_km: float, speed: float = _SPEED_KM_H) -> int:
     return max(1, math.ceil(distance_km / speed * 60))
 
 
-def _to_int_or_zero(val: Any) -> int:
-    """安全转 int，None/非数字一律返回 0。"""
+def _to_int_or_zero(val: Any, default: int = 0) -> int:
+    """Safely convert to int; return default for None/non-numeric values."""
     if val is None:
-        return 0
+        return default
     try:
         return int(val)
     except (ValueError, TypeError):
-        return 0
+        return default
 
 
 def _sim_minutes_to_wall(sim_min: int) -> datetime:
@@ -730,6 +730,16 @@ class StateTracker:
                     if current_min >= activation or 0 < activation - current_min < 180:
                         urgent.append(task)
                     continue
+            if task_type == "scheduled_event":
+                pickup_min = _to_int_or_zero(task.get("pickup_min"))
+                home_deadline = _to_int_or_zero(task.get("home_deadline_min"))
+                release_min = _to_int_or_zero(task.get("release_min")) or home_deadline
+                if pickup_min > 0 and (
+                    0 < pickup_min - current_min < 720
+                    or pickup_min <= current_min < release_min
+                ):
+                    urgent.append(task)
+                continue
             if task_type == "monthly_visit":
                 min_days = _to_int_or_zero(task.get("min_visit_days")) or 1
                 total_days = max(1, math.ceil(horizon / 1440))
@@ -1049,7 +1059,7 @@ class PreferenceEngine:
     def _parse_time_restriction(self, content: str, base: dict) -> dict | None:
         if "不接单" not in content and "不空" not in content:
             return None
-        match = re.search(r"(\d{1,2})[点:：](?:\d{2})?\s*(?:至|-|到)\s*(?:次日|翌日)?\s*(\d{1,2})[点:：]?", content)
+        match = re.search(r"(\d{1,2})[点:：](?:\d{2})?\s*(?:至|-|到)\s*(?:次日|翌日|上午|下午|早上|中午)?\s*(\d{1,2})[点:：]?", content)
         if not match:
             return None
         return {
@@ -1750,7 +1760,7 @@ class RuleLayer:
 
         if pickup_min <= current_min < deadline:
             pickup_dist = haversine(lat, lng, float(pickup_lat), float(pickup_lng))
-            if pickup_dist > 1.0 and current_min < pickup_min + 120:
+            if pickup_dist > 1.0:
                 return self._reposition(float(pickup_lat), float(pickup_lng))
             if pickup_dist <= 1.0 and current_min < pickup_min + int(params.get("pickup_wait_minutes", 10)):
                 return self._wait(int(params.get("pickup_wait_minutes", 10)))
@@ -1875,6 +1885,7 @@ class RuleLayer:
                 and current_min % 1440 == 0
                 and state.was_waiting_until(current_min)
             )
+            minute_of_day = current_min % 1440
 
             # 已经在连续休息段中时，优先一口气补足，避免查询货源打断连续休息。
             if current_streak > 0 or carried_into_new_day:
@@ -1882,6 +1893,11 @@ class RuleLayer:
                 if need > 0:
                     wait_min = max(1, min(need, remaining_today, remaining_total))
                     return self._wait(wait_min)
+
+            # 清晨先补完整休息块，避免白天多次短 wait 被查询耗时切碎。
+            if minute_of_day < 6 * 60:
+                wait_min = max(1, min(required_min, remaining_today, remaining_total))
+                return self._wait(wait_min)
 
             # 仅在剩余时间刚好只够重新形成完整连续休息段时才强制。
             if remaining_today <= required_min + 30:
@@ -2598,6 +2614,19 @@ class HeuristicLayer:
             # RuleLayer._check_forced_rest 在剩余时间仅够补休时仍会强制 wait
             _finish = current_min + total_time
 
+            # 赴装货点空驶上限是单笔硬约束，超限订单直接剔除。
+            if cargo_id not in mandatory_cargo_ids:
+                _deadhead_blocked = False
+                for c in constraints:
+                    if c.get("type") != "max_deadhead_distance":
+                        continue
+                    max_km = float(c.get("params", {}).get("max_deadhead_km", 9999))
+                    if distance_km > max_km:
+                        _deadhead_blocked = True
+                        break
+                if _deadhead_blocked:
+                    continue
+
             # 过滤: 候选完成后赶不到 mandatory_cargo pickup 的订单
             # 仅在 mandatory 窗口临近（<12h）时才硬过滤，否则交给评分惩罚
             if mandatory_pickups and cargo_id not in mandatory_cargo_ids:
@@ -3245,6 +3274,111 @@ class ModelDecisionService:
             self._state_tracker[driver_id] = StateTracker()
         return self._state_tracker[driver_id]
 
+    @staticmethod
+    def _task_key(task: dict) -> tuple:
+        task_type = task.get("type", "")
+        if task_type == "mandatory_cargo":
+            return (task_type, str(task.get("target") or task.get("cargo_id") or ""))
+        if task_type == "scheduled_event":
+            return (
+                task_type,
+                _to_int_or_zero(task.get("pickup_min")),
+                _to_int_or_zero(task.get("home_deadline_min")),
+            )
+        if task_type == "monthly_visit":
+            return (task_type, str(task.get("target", "")))
+        if task_type == "daily_home_deadline":
+            return (
+                task_type,
+                str(task.get("home_lat", "")),
+                str(task.get("home_lng", "")),
+                _to_int_or_zero(task.get("deadline_hour")),
+            )
+        return (task_type, str(task.get("target", "")))
+
+    def _sync_constraint_tasks(
+        self,
+        state: StateTracker,
+        constraints: list[dict],
+        horizon: int,
+    ) -> None:
+        """把运行中才可见的关键约束补进 open_tasks。"""
+        known = {self._task_key(t) for t in state.open_tasks}
+        known.update(self._task_key(t) for t in state.completed_tasks)
+
+        def add_once(task: dict) -> None:
+            key = self._task_key(task)
+            if key in known:
+                return
+            state.open_tasks.append(task)
+            known.add(key)
+
+        for c in constraints:
+            ctype = c.get("type", "")
+            p = c.get("params", {})
+
+            if ctype == "mandatory_cargo":
+                cargo_id = str(p.get("cargo_id", "")).strip()
+                if not cargo_id:
+                    continue
+                task = {
+                    "type": "mandatory_cargo",
+                    "target": cargo_id,
+                    "activation_min": _to_int_or_zero(p.get("activation_min")),
+                    "pickup_lat": p.get("pickup_lat"),
+                    "pickup_lng": p.get("pickup_lng"),
+                    "deadline_minute": horizon,
+                    "priority": 1,
+                }
+                if c.get("visible_end_time"):
+                    try:
+                        task["window_end"] = _wall_to_sim_minutes(str(c["visible_end_time"]))
+                    except Exception:
+                        pass
+                add_once(task)
+
+            elif ctype == "scheduled_event":
+                task = {
+                    "type": "scheduled_event",
+                    "target": p.get("description", "event"),
+                    "deadline_minute": _to_int_or_zero(p.get("home_deadline_min")),
+                    "priority": 1,
+                    "pickup_lat": p.get("pickup_lat"),
+                    "pickup_lng": p.get("pickup_lng"),
+                    "home_lat": p.get("home_lat"),
+                    "home_lng": p.get("home_lng"),
+                    "pickup_min": _to_int_or_zero(p.get("pickup_min")),
+                    "home_deadline_min": _to_int_or_zero(p.get("home_deadline_min")),
+                    "release_min": _to_int_or_zero(p.get("release_min")),
+                    "pickup_wait_minutes": _to_int_or_zero(p.get("pickup_wait_minutes"), 10),
+                }
+                if task["pickup_min"] > 0 and task["home_deadline_min"] > 0:
+                    add_once(task)
+
+            elif ctype == "monthly_visit_requirement":
+                target_lat = p.get("target_lat")
+                target_lng = p.get("target_lng")
+                if target_lat is None or target_lng is None:
+                    continue
+                add_once({
+                    "type": "monthly_visit",
+                    "target": f"lat={target_lat},lng={target_lng}",
+                    "min_visit_days": _to_int_or_zero(p.get("min_visit_days")) or 1,
+                    "deadline_minute": horizon,
+                    "priority": 2,
+                })
+
+            elif ctype == "daily_home_deadline":
+                add_once({
+                    "type": "daily_home_deadline",
+                    "target": "home",
+                    "home_lat": p.get("home_lat"),
+                    "home_lng": p.get("home_lng"),
+                    "deadline_hour": _to_int_or_zero(p.get("deadline_hour"), 23),
+                    "deadline_minute": _to_int_or_zero(p.get("deadline_hour"), 23) * 60,
+                    "priority": 2,
+                })
+
     def decide(self, driver_id: str) -> dict:
         """主决策方法：初始化 → 状态更新 → 规则层 → 查询货源 → 启发式 → LLM"""
         try:
@@ -3773,6 +3907,8 @@ class ModelDecisionService:
             except Exception as e:
                 self._logger.warning("生成战略计划失败 driver=%s: %s", driver_id, e)
 
+        self._sync_constraint_tasks(state, constraints, horizon)
+
         # 3.8（Task #4）刷新任务进度
         try:
             _hist_resp = self._api.query_decision_history(driver_id, -1) or {}
@@ -3866,6 +4002,60 @@ class ModelDecisionService:
                                 return _validated
                             break
 
+        # 5.56 mandatory_cargo 阻塞：即将激活的熟货不允许被其他单抢占
+        for _task in state.open_tasks:
+            if _task.get("type") != "mandatory_cargo":
+                continue
+            _target_cargo_id = str(_task.get("target", ""))
+            if not _target_cargo_id:
+                continue
+            _activation = _to_int_or_zero(_task.get("activation_min"))
+            if _activation <= 0:
+                continue
+            _time_to_activation = _activation - current_min
+            if _time_to_activation > 360:  # >6h，不阻塞
+                continue
+            # 从 constraints 取 pickup 坐标
+            _mp_lat = _mp_lng = None
+            for c in constraints:
+                if c.get("type") == "mandatory_cargo":
+                    p = c.get("params", {})
+                    if str(p.get("cargo_id", "")) == _target_cargo_id:
+                        _mp_lat = p.get("pickup_lat")
+                        _mp_lng = p.get("pickup_lng")
+                        break
+            if _mp_lat is None or _mp_lng is None:
+                continue
+            _dist_to_pickup = haversine(
+                float(status_after_query.get("current_lat", 0)),
+                float(status_after_query.get("current_lng", 0)),
+                float(_mp_lat), float(_mp_lng),
+            )
+            _travel_to_pickup = _distance_to_minutes(_dist_to_pickup)
+            # 如果赶不到 pickup 点，reposition 过去
+            if _dist_to_pickup > 1.0 and current_min + _travel_to_pickup + 30 >= _activation:
+                _block_decision = {
+                    "action": "reposition",
+                    "params": {"latitude": float(_mp_lat), "longitude": float(_mp_lng)},
+                }
+                _block_validated = self._validate_action(
+                    _block_decision, status_after_query, constraints)
+                if _block_validated:
+                    self._logger.info(
+                        "mandatory_cargo 阻塞: reposition 到 pickup driver=%s cargo=%s dist=%.1fkm",
+                        driver_id, _target_cargo_id, _dist_to_pickup)
+                    self._update_state_after_decision(state, _block_validated, current_min)
+                    return _block_validated
+            # 如果已经在 pickup 附近或刚好能到，等在原地不要接其他单
+            if _time_to_activation <= 120:
+                _wait_dur = max(1, min(60, _time_to_activation))
+                self._logger.info(
+                    "mandatory_cargo 阻塞: 等待激活 driver=%s cargo=%s wait=%dmin",
+                    driver_id, _target_cargo_id, _wait_dur)
+                _wait_decision = {"action": "wait", "params": {"duration_minutes": _wait_dur}}
+                self._update_state_after_decision(state, _wait_decision, current_min)
+                return _wait_decision
+
         # 5.6 更新未来机会预测器统计（Task #4）
         try:
             hour_now = _get_hour_of_day(current_min)
@@ -3935,6 +4125,37 @@ class ModelDecisionService:
 
         # 7. 无货源时：评估 wait value 而非默认 wait 30
         if not items:
+            # bounding_box 冷启动：长时间无货时主动空驶到约束区域中心
+            _bb_center = None
+            for c in constraints:
+                if c.get("type") == "spatial_restrict" and c.get("params", {}).get("type") == "bounding_box":
+                    bb = c["params"].get("bounding_box", {})
+                    _lat_min = bb.get("lat_min")
+                    _lat_max = bb.get("lat_max")
+                    _lng_min = bb.get("lng_min")
+                    _lng_max = bb.get("lng_max")
+                    if all(v is not None for v in [_lat_min, _lat_max, _lng_min, _lng_max]):
+                        _bb_center = ((_lat_min + _lat_max) / 2, (_lng_min + _lng_max) / 2)
+                    break
+            if _bb_center is not None:
+                _bb_dist = haversine(
+                    float(status_after_query.get("current_lat", 0)),
+                    float(status_after_query.get("current_lng", 0)),
+                    _bb_center[0], _bb_center[1])
+                # 不在 bounding_box 中心附近时，空驶过去
+                if _bb_dist > 20:
+                    _bb_decision = {
+                        "action": "reposition",
+                        "params": {"latitude": _bb_center[0], "longitude": _bb_center[1]},
+                    }
+                    _bb_validated = self._validate_action(
+                        _bb_decision, status_after_query, constraints)
+                    if _bb_validated:
+                        self._logger.info(
+                            "bounding_box 冷启动: reposition 到中心 driver=%s (%.2f,%.2f)",
+                            driver_id, _bb_center[0], _bb_center[1])
+                        self._update_state_after_decision(state, _bb_validated, current_min)
+                        return _bb_validated
             wait_val = HeuristicLayer.estimate_wait_value(
                 current_min, state, constraints, horizon, self.opportunity_predictor)
             wait_duration = 30 if wait_val > -100 else 60
@@ -4236,9 +4457,108 @@ class ModelDecisionService:
 
             if task_type == "mandatory_cargo":
                 # D009场景：指定熟货必接
-                # 如果快到deadline了，我们不能主动接（需要在货源出现时接），
-                # 但可以让司机等待在当前位置，不要跑远
-                # 返回短时等待，后续主流程中若看到指定货源会优先接
+                # 如果快到激活时间，移动到 pickup 点附近等待
+                activation = _to_int_or_zero(task.get("activation_min"))
+                pickup_lat = task.get("pickup_lat")
+                pickup_lng = task.get("pickup_lng")
+                if pickup_lat is None:
+                    for c in constraints:
+                        if c.get("type") == "mandatory_cargo":
+                            p = c.get("params", {})
+                            if str(p.get("cargo_id", "")) == str(task.get("target", "")):
+                                pickup_lat = p.get("pickup_lat")
+                                pickup_lng = p.get("pickup_lng")
+                                break
+                if pickup_lat is not None and pickup_lng is not None:
+                    pickup_lat = float(pickup_lat)
+                    pickup_lng = float(pickup_lng)
+                    dist = haversine(cur_lat, cur_lng, pickup_lat, pickup_lng)
+                    if dist > 1.0:
+                        return {"action": "reposition",
+                                "params": {"latitude": pickup_lat, "longitude": pickup_lng}}
+                if activation > 0 and current_min < activation:
+                    return {"action": "wait",
+                            "params": {"duration_minutes": max(1, min(30, activation - current_min))}}
+                # Once the mandatory cargo is active and we are already at pickup,
+                # let the cargo-query path run so the visible cargo can be taken.
+                return None
+
+            elif task_type == "scheduled_event":
+                # D010场景：家事临时约定（接配偶 → 回家 → 静止等待）
+                pickup_min = _to_int_or_zero(task.get("pickup_min"))
+                home_deadline = _to_int_or_zero(task.get("home_deadline_min"))
+                release_min = _to_int_or_zero(task.get("release_min"))
+                pickup_wait = _to_int_or_zero(task.get("pickup_wait_minutes"), 10)
+                pickup_lat = task.get("pickup_lat")
+                pickup_lng = task.get("pickup_lng")
+                home_lat = task.get("home_lat")
+                home_lng = task.get("home_lng")
+
+                # 也从 constraints 中补充坐标
+                if pickup_lat is None:
+                    for c in constraints:
+                        if c.get("type") == "scheduled_event":
+                            p = c.get("params", {})
+                            pickup_lat = p.get("pickup_lat")
+                            pickup_lng = p.get("pickup_lng")
+                            home_lat = home_lat or p.get("home_lat")
+                            home_lng = home_lng or p.get("home_lng")
+                            pickup_min = pickup_min or _to_int_or_zero(p.get("pickup_min"))
+                            home_deadline = home_deadline or _to_int_or_zero(p.get("home_deadline_min"))
+                            release_min = release_min or _to_int_or_zero(p.get("release_min"))
+                            pickup_wait = pickup_wait or _to_int_or_zero(p.get("pickup_wait_minutes"), 10)
+                            if pickup_lat:
+                                break
+
+                if pickup_lat is None or pickup_lng is None:
+                    continue
+
+                pickup_lat = float(pickup_lat)
+                pickup_lng = float(pickup_lng)
+                pickup_dist = haversine(cur_lat, cur_lng, pickup_lat, pickup_lng)
+
+                # 阶段1: pickup 之前 → 移动到 pickup 点
+                if pickup_min > 0 and current_min < pickup_min:
+                    if pickup_dist > 1.0:
+                        return {"action": "reposition",
+                                "params": {"latitude": pickup_lat, "longitude": pickup_lng}}
+                    return {"action": "wait",
+                            "params": {"duration_minutes": max(1, min(60, pickup_min - current_min))}}
+
+                # 阶段2: pickup ~ home_deadline → 先完成 pickup 等待，再移动到 home
+                if home_deadline > 0 and current_min < home_deadline and not task.get("pickup_wait_done"):
+                    if pickup_dist > 1.0:
+                        return {"action": "reposition",
+                                "params": {"latitude": pickup_lat, "longitude": pickup_lng}}
+                    wait_until = _to_int_or_zero(task.get("pickup_wait_until"))
+                    if wait_until <= 0:
+                        task["pickup_wait_until"] = current_min + max(1, pickup_wait)
+                        return {"action": "wait",
+                                "params": {"duration_minutes": max(1, pickup_wait)}}
+                    if current_min < wait_until:
+                        return {"action": "wait",
+                                "params": {"duration_minutes": max(1, wait_until - current_min)}}
+                    task["pickup_wait_done"] = True
+
+                if home_lat is not None and home_lng is not None:
+                    home_lat = float(home_lat)
+                    home_lng = float(home_lng)
+                    home_dist = haversine(cur_lat, cur_lng, home_lat, home_lng)
+                    if home_deadline > 0 and current_min < home_deadline:
+                        if home_dist > 1.0:
+                            return {"action": "reposition",
+                                    "params": {"latitude": home_lat, "longitude": home_lng}}
+                        return {"action": "wait",
+                                "params": {"duration_minutes": max(1, min(60, home_deadline - current_min))}}
+
+                    # 阶段3: home_deadline ~ release → 留在 home
+                    if release_min > 0 and current_min < release_min:
+                        if home_dist > 1.0:
+                            return {"action": "reposition",
+                                    "params": {"latitude": home_lat, "longitude": home_lng}}
+                        return {"action": "wait",
+                                "params": {"duration_minutes": max(1, min(480, release_min - current_min))}}
+
                 continue
 
             elif task_type == "monthly_visit":

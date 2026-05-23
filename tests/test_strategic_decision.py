@@ -47,6 +47,7 @@ from agent.model_decision_service import (
     _distance_to_minutes,
 )
 from agent.strategic_planner import StrategicPlanner
+from server.bench.simulation_orchestrator import SimulationOrchestrator
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1059,6 +1060,36 @@ class TestDailyRestSoftPenalty:
         assert result[0]["penalty_score"] > 0
 
 
+class TestMaxDeadheadHardFilter:
+    """单笔赴装货点空驶上限应在候选阶段硬过滤。"""
+
+    def test_max_deadhead_distance_filters_candidate(self):
+        state = StateTracker()
+        layer = HeuristicLayer()
+        status = {"simulation_progress_minutes": 600, "simulation_horizon_minutes": 43200}
+        constraints = [{
+            "type": "max_deadhead_distance",
+            "params": {"max_deadhead_km": 50},
+            "severity": "hard",
+        }]
+        items = [{
+            "distance_km": 60.0,
+            "cargo": {
+                "cargo_id": "TOO_FAR",
+                "cargo_name": "general",
+                "price": 2000,
+                "cost_time_minutes": 60,
+                "start": {"lat": 23.0, "lng": 113.0},
+                "end": {"lat": 23.1, "lng": 113.1},
+                "load_time": None,
+            },
+        }]
+
+        result = layer.score_and_rank(items, status, state, constraints, top_n=5)
+
+        assert result == []
+
+
 class TestSelectBestByTrueNet:
     """_select_best_by_true_net 应正确应用 penalty_margin 决策规则。"""
 
@@ -1262,6 +1293,234 @@ class TestContinuousRestFixes:
         decision = layer._check_forced_rest(2880, state, constraints, 4320)
 
         assert decision == {"action": "wait", "params": {"duration_minutes": 240}}
+
+    def test_forced_rest_starts_as_morning_block(self):
+        state = StateTracker()
+        layer = RuleLayer()
+        constraints = [{
+            "type": "daily_rest",
+            "severity": "soft",
+            "params": {"min_continuous_minutes": 240},
+            "penalty_amount": 300,
+        }]
+
+        decision = layer._check_forced_rest(60, state, constraints, 43200)
+
+        assert decision == {"action": "wait", "params": {"duration_minutes": 240}}
+
+
+class TestRuntimeConstraintTaskSync:
+    """运行中变为可见的关键约束应补进 open_tasks。"""
+
+    def test_visible_mandatory_cargo_is_added_to_open_tasks(self):
+        api = type("FakeApi", (), {"model_chat_completion": lambda self, *a, **kw: {}})()
+        svc = ModelDecisionService(api)
+        state = StateTracker()
+        state.set_strategic_plan({"must_do_tasks": []})
+        constraints = [{
+            "type": "mandatory_cargo",
+            "visible_end_time": "2026-03-03 16:08:24",
+            "params": {
+                "cargo_id": "240646",
+                "activation_min": 3763,
+                "pickup_lat": 24.81,
+                "pickup_lng": 113.58,
+            },
+        }]
+
+        svc._sync_constraint_tasks(state, constraints, 44640)
+
+        assert len(state.open_tasks) == 1
+        task = state.open_tasks[0]
+        assert task["type"] == "mandatory_cargo"
+        assert task["target"] == "240646"
+        assert task["window_end"] > task["activation_min"]
+
+    def test_sync_constraints_accepts_default_fields(self):
+        api = type("FakeApi", (), {"model_chat_completion": lambda self, *a, **kw: {}})()
+        svc = ModelDecisionService(api)
+        state = StateTracker()
+        state.set_strategic_plan({"must_do_tasks": []})
+        constraints = [
+            {
+                "type": "scheduled_event",
+                "params": {
+                    "pickup_lat": 23.21,
+                    "pickup_lng": 113.37,
+                    "home_lat": 23.19,
+                    "home_lng": 113.36,
+                    "pickup_min": 13560,
+                    "home_deadline_min": 14280,
+                    "release_min": 18600,
+                },
+            },
+            {
+                "type": "daily_home_deadline",
+                "params": {
+                    "home_lat": 23.12,
+                    "home_lng": 113.28,
+                },
+            },
+        ]
+
+        svc._sync_constraint_tasks(state, constraints, 43200)
+
+        by_type = {task["type"]: task for task in state.open_tasks}
+        assert by_type["scheduled_event"]["pickup_wait_minutes"] == 10
+        assert by_type["daily_home_deadline"]["deadline_hour"] == 23
+
+    def test_scheduled_event_remains_urgent_through_release(self):
+        state = StateTracker()
+        state.open_tasks = [{
+            "type": "scheduled_event",
+            "pickup_min": 100,
+            "home_deadline_min": 200,
+            "release_min": 300,
+            "deadline_minute": 200,
+        }]
+
+        assert state.has_urgent_tasks(100)
+        assert state.has_urgent_tasks(250)
+
+    def test_scheduled_event_waits_at_pickup_before_home(self):
+        api = type("FakeApi", (), {"model_chat_completion": lambda self, *a, **kw: {}})()
+        svc = ModelDecisionService(api)
+        state = StateTracker()
+        task = {
+            "type": "scheduled_event",
+            "pickup_min": 100,
+            "home_deadline_min": 200,
+            "release_min": 300,
+            "pickup_lat": 23.21,
+            "pickup_lng": 113.37,
+            "home_lat": 23.19,
+            "home_lng": 113.36,
+            "pickup_wait_minutes": 10,
+            "priority": 1,
+        }
+        state.open_tasks = [task]
+
+        decision = svc._handle_urgent_tasks(
+            state.has_urgent_tasks(100),
+            {
+                "simulation_progress_minutes": 100,
+                "current_lat": 23.21,
+                "current_lng": 113.37,
+            },
+            state,
+            [],
+        )
+
+        assert decision == {"action": "wait", "params": {"duration_minutes": 10}}
+        assert task["pickup_wait_until"] == 110
+
+        decision = svc._handle_urgent_tasks(
+            state.has_urgent_tasks(110),
+            {
+                "simulation_progress_minutes": 110,
+                "current_lat": 23.21,
+                "current_lng": 113.37,
+            },
+            state,
+            [],
+        )
+
+        assert decision["action"] == "reposition"
+        assert decision["params"] == {"latitude": 23.19, "longitude": 113.36}
+        assert task["pickup_wait_done"] is True
+
+    def test_active_mandatory_cargo_at_pickup_allows_cargo_query(self):
+        api = type("FakeApi", (), {"model_chat_completion": lambda self, *a, **kw: {}})()
+        svc = ModelDecisionService(api)
+        state = StateTracker()
+        task = {
+            "type": "mandatory_cargo",
+            "target": "240646",
+            "activation_min": 100,
+            "pickup_lat": 24.81,
+            "pickup_lng": 113.58,
+            "priority": 1,
+        }
+        state.open_tasks = [task]
+
+        decision = svc._handle_urgent_tasks(
+            state.has_urgent_tasks(100),
+            {
+                "simulation_progress_minutes": 100,
+                "current_lat": 24.81,
+                "current_lng": 113.58,
+            },
+            state,
+            [],
+        )
+
+        assert decision is None
+
+    def test_visible_active_mandatory_cargo_is_taken_after_query(self):
+        state = StateTracker()
+        state.open_tasks = [{
+            "type": "mandatory_cargo",
+            "target": "240646",
+        }]
+        layer = RuleLayer()
+        status = {
+            "simulation_progress_minutes": 100,
+            "simulation_horizon_minutes": 1000,
+            "current_lat": 24.81,
+            "current_lng": 113.58,
+        }
+        constraints = [{
+            "type": "mandatory_cargo",
+            "params": {
+                "cargo_id": "240646",
+                "activation_min": 100,
+                "pickup_lat": 24.81,
+                "pickup_lng": 113.58,
+            },
+        }]
+        items = [{"cargo": {"cargo_id": "240646"}}]
+
+        decision = layer.evaluate(status, state, constraints, items)
+
+        assert decision == {"action": "take_order", "params": {"cargo_id": "240646"}}
+
+    def test_pending_mandatory_cargo_waits_until_activation_at_pickup(self):
+        api = type("FakeApi", (), {"model_chat_completion": lambda self, *a, **kw: {}})()
+        svc = ModelDecisionService(api)
+        state = StateTracker()
+        task = {
+            "type": "mandatory_cargo",
+            "target": "240646",
+            "activation_min": 100,
+            "pickup_lat": 24.81,
+            "pickup_lng": 113.58,
+            "priority": 1,
+        }
+        state.open_tasks = [task]
+
+        decision = svc._handle_urgent_tasks(
+            state.has_urgent_tasks(90),
+            {
+                "simulation_progress_minutes": 90,
+                "current_lat": 24.81,
+                "current_lng": 113.58,
+            },
+            state,
+            [],
+        )
+
+        assert decision == {"action": "wait", "params": {"duration_minutes": 10}}
+
+
+class TestOutputPrecision:
+    """动作日志坐标精度不能被压到两位小数。"""
+
+    def test_float_output_keeps_six_decimals(self):
+        orch = object.__new__(SimulationOrchestrator)
+
+        out = orch._normalize_for_output({"lat": 23.27797, "lng": 114.073838})
+
+        assert out == {"lat": 23.27797, "lng": 114.073838}
 
 
 class TestRepositionSafety:
