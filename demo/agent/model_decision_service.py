@@ -2571,6 +2571,29 @@ class HeuristicLayer:
             if _violates_time_restriction(current_min, current_min + total_time, constraints):
                 continue
 
+            # 过滤: 卸货点违反空间约束（bounding_box / forbidden_circle）
+            # mandatory_cargo 目标跳过此过滤
+            if cargo_id not in mandatory_cargo_ids:
+                _spatial_blocked = False
+                for c in constraints:
+                    if c.get("type") != "spatial_restrict":
+                        continue
+                    p = c.get("params", {})
+                    if p.get("type") == "bounding_box":
+                        bb = p.get("bounding_box", {})
+                        if not PreferenceEngine._in_bounding_box(end_lat, end_lng, bb):
+                            _spatial_blocked = True
+                            break
+                    elif p.get("type") == "forbidden_circle":
+                        cx = float(p.get("center_lat", 0))
+                        cy = float(p.get("center_lng", 0))
+                        r = float(p.get("radius_km", 20))
+                        if haversine(end_lat, end_lng, cx, cy) < r:
+                            _spatial_blocked = True
+                            break
+                if _spatial_blocked:
+                    continue
+
             # daily_rest 不再硬过滤，由 soft_penalty_cost 经济惩罚处理
             # RuleLayer._check_forced_rest 在剩余时间仅够补休时仍会强制 wait
             _finish = current_min + total_time
