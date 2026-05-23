@@ -437,6 +437,9 @@ class StateTracker:
         self.wait_intervals.append((start_min, start_min + duration))
         self.last_action_end_min = start_min + duration
 
+    def was_waiting_until(self, current_min: int) -> bool:
+        return any(e == current_min for _, e in self.wait_intervals)
+
     def record_reposition(self, sim_min: int) -> None:
         day_idx = _get_day_index(sim_min)
         self.active_days.add(day_idx)
@@ -471,6 +474,34 @@ class StateTracker:
 
         # 返回最长合并区间
         return max(e - s for s, e in merged)
+
+    def get_current_rest_streak(self, current_min: int) -> int:
+        """获取紧贴当前时刻的连续休息分钟数。"""
+        day_idx = _get_day_index(current_min)
+        day_start = day_idx * 1440
+        intervals = []
+        for s, e in self.wait_intervals:
+            overlap_s = max(s, day_start)
+            overlap_e = min(e, current_min)
+            if overlap_e > overlap_s:
+                intervals.append((overlap_s, overlap_e))
+
+        if not intervals:
+            return 0
+
+        intervals.sort()
+        merged = [intervals[0]]
+        for s, e in intervals[1:]:
+            prev_s, prev_e = merged[-1]
+            if s <= prev_e:
+                merged[-1] = (prev_s, max(prev_e, e))
+            else:
+                merged.append((s, e))
+
+        last_s, last_e = merged[-1]
+        if last_e == current_min:
+            return last_e - last_s
+        return 0
 
     def get_orders_today(self, current_min: int) -> int:
         day_idx = _get_day_index(current_min)
@@ -1633,7 +1664,7 @@ class RuleLayer:
                 tt = t.get("type", "")
                 _open_types.add(tt)
                 if tt == "mandatory_cargo":
-                    tid = str(t.get("target", ""))
+                    tid = str(t.get("target") or t.get("cargo_id") or "")
                     if tid:
                         _open_mandatory_ids.add(tid)
 
@@ -1823,9 +1854,8 @@ class RuleLayer:
                            constraints: list[dict], horizon: int) -> dict | None:
         """检查今天是否满足了最低连续休息要求。
 
-        仅在当天剩余时间刚好只够补休时才强制 wait（精确到 need+30min）。
-        日常校验交给 _validate_take_order_constraints 的 daily_rest 检查，
-        避免规则层过早阻断导致无法搜索短单。
+        已经处于连续休息段时会继续补足；否则只在当天剩余时间刚好
+        只够重新形成完整休息段时才强制 wait。
         """
         for c in constraints:
             if c.get("type") != "daily_rest":
@@ -1837,12 +1867,25 @@ class RuleLayer:
             current_rest = state.get_max_continuous_rest_today(current_min)
             if current_rest >= required_min:
                 continue  # 已满足，无需强制
+            current_streak = state.get_current_rest_streak(current_min)
+            remaining_total = horizon - current_min
             remaining_today = 1440 - (current_min % 1440)
-            need = required_min - current_rest
-            # 仅在剩余时间刚好只够补休时才强制（留给搜索层更多机会）
-            if remaining_today <= need + 30:
-                remaining_total = horizon - current_min
-                wait_min = max(1, min(need, remaining_today, remaining_total))
+            carried_into_new_day = (
+                current_min > 0
+                and current_min % 1440 == 0
+                and state.was_waiting_until(current_min)
+            )
+
+            # 已经在连续休息段中时，优先一口气补足，避免查询货源打断连续休息。
+            if current_streak > 0 or carried_into_new_day:
+                need = required_min - current_streak
+                if need > 0:
+                    wait_min = max(1, min(need, remaining_today, remaining_total))
+                    return self._wait(wait_min)
+
+            # 仅在剩余时间刚好只够重新形成完整连续休息段时才强制。
+            if remaining_today <= required_min + 30:
+                wait_min = max(1, min(required_min, remaining_today, remaining_total))
                 return self._wait(wait_min)
         return None
 
@@ -2018,19 +2061,45 @@ class HeuristicLayer:
             cost += penalty_amount
         return cost
 
+    def _violates_daily_home_deadline(
+        self,
+        end_lat: float,
+        end_lng: float,
+        finish_min: int,
+        current_min: int,
+        constraint: dict,
+    ) -> bool:
+        params = constraint.get("params", {})
+        home_lat = params.get("home_lat")
+        home_lng = params.get("home_lng")
+        if home_lat is None or home_lng is None:
+            return False
+        try:
+            deadline_hour = int(params.get("deadline_hour", 23))
+            deadline_min = _get_day_index(current_min) * 1440 + deadline_hour * 60
+            if current_min >= deadline_min:
+                return False
+            travel_home_min = _distance_to_minutes(
+                haversine(end_lat, end_lng, float(home_lat), float(home_lng))
+            )
+            return finish_min + travel_home_min > deadline_min
+        except (TypeError, ValueError):
+            return False
+
     def _future_position_cost(
         self,
         end_lat: float,
         end_lng: float,
         finish_min: int,
+        current_min: int,
         constraints: list[dict],
         state: StateTracker,
         horizon: int,
         mandatory_pickups: list[dict],
     ) -> float:
         cost = 0.0
-        current_day = _get_day_index(finish_min)
-        day_end = (current_day + 1) * 1440
+        finish_day = _get_day_index(finish_min)
+        day_end = (finish_day + 1) * 1440
 
         for c in constraints:
             ctype = c.get("type")
@@ -2044,11 +2113,12 @@ class HeuristicLayer:
                     continue
                 try:
                     deadline_hour = int(p.get("deadline_hour", 23))
-                    deadline_min = current_day * 1440 + deadline_hour * 60
-                    cost += self._target_position_cost(
-                        end_lat, end_lng, float(home_lat), float(home_lng),
-                        finish_min, deadline_min, penalty_amount,
-                    )
+                    deadline_min = _get_day_index(current_min) * 1440 + deadline_hour * 60
+                    if current_min < deadline_min:
+                        cost += self._target_position_cost(
+                            end_lat, end_lng, float(home_lat), float(home_lng),
+                            finish_min, deadline_min, penalty_amount,
+                        )
                 except (TypeError, ValueError):
                     continue
 
@@ -2141,21 +2211,30 @@ class HeuristicLayer:
                         pass
 
         result: list[dict] = []
-        if not hasattr(state, "open_tasks"):
-            return result
-        for task in state.open_tasks:
-            if task.get("type") != "mandatory_cargo":
-                continue
-            cargo_id = str(task.get("target", ""))
-            if not cargo_id:
-                continue
-            params = cargo_params.get(cargo_id, {})
-            # 也尝试从 task 自身取（fallback plan 可能直接放了这些字段）
+        open_tasks = list(getattr(state, "open_tasks", []) or [])
+        completed_tasks = list(getattr(state, "completed_tasks", []) or [])
+
+        completed_ids = {
+            str(t.get("target") or t.get("cargo_id") or "").strip()
+            for t in completed_tasks
+            if t.get("type") == "mandatory_cargo"
+        }
+        completed_ids.discard("")
+
+        open_ids = {
+            str(t.get("target") or t.get("cargo_id") or "").strip()
+            for t in open_tasks
+            if t.get("type") == "mandatory_cargo"
+        }
+        open_ids.discard("")
+
+        def _make_entry(cargo_id: str, params: dict, task: dict | None = None) -> dict | None:
+            task = task or {}
             activation_min = params.get("activation_min") or task.get("activation_min")
             pickup_lat = params.get("pickup_lat") or task.get("pickup_lat")
             pickup_lng = params.get("pickup_lng") or task.get("pickup_lng")
             if activation_min is None or pickup_lat is None or pickup_lng is None:
-                continue
+                return None
             try:
                 entry = {
                     "cargo_id": cargo_id,
@@ -2163,18 +2242,41 @@ class HeuristicLayer:
                     "pickup_lat": float(pickup_lat),
                     "pickup_lng": float(pickup_lng),
                 }
-                # window_end: 装货时间窗结束，比 activation 更精确的截止点
-                # 优先从 constraint/task 取，其次从 items 的 load_time 取
-                window_end = (params.get("window_end") or task.get("window_end")
-                              or cargo_window_end.get(cargo_id))
-                if window_end is not None:
-                    try:
-                        entry["window_end"] = int(window_end)
-                    except (ValueError, TypeError):
-                        pass
-                result.append(entry)
             except (ValueError, TypeError):
+                return None
+
+            window_end = (
+                params.get("window_end")
+                or task.get("window_end")
+                or cargo_window_end.get(cargo_id)
+            )
+            if window_end is not None:
+                try:
+                    entry["window_end"] = int(window_end)
+                except (ValueError, TypeError):
+                    pass
+            return entry
+
+        for task in open_tasks:
+            if task.get("type") != "mandatory_cargo":
                 continue
+            cargo_id = str(task.get("target") or task.get("cargo_id") or "").strip()
+            if not cargo_id or cargo_id in completed_ids:
+                continue
+            entry = _make_entry(cargo_id, cargo_params.get(cargo_id, {}), task)
+            if entry is not None:
+                result.append(entry)
+
+        included_ids = {str(e.get("cargo_id", "")) for e in result}
+        for cargo_id, params in cargo_params.items():
+            if cargo_id in completed_ids or cargo_id in included_ids:
+                continue
+            if open_ids and cargo_id not in open_ids:
+                continue
+            entry = _make_entry(cargo_id, params)
+            if entry is not None:
+                result.append(entry)
+
         return result
 
     # ── true_net 分类与估算方法 ──
@@ -2303,8 +2405,8 @@ class HeuristicLayer:
             if haul_km > max_km:
                 return p_amount * 2.0 if p_amount else (haul_km - max_km) * 15.0
         if ctype == "daily_home_deadline":
-            # 硬约束：高罚分（>=500），全额计入
-            return p_amount * 2.0 if p_amount else 1000.0
+            # 具体可行性在 score_and_rank 中按 finish_min 精确过滤。
+            return 0.0
         if ctype == "cargo_category_ban":
             return p_amount * 2.0 if p_amount else 500.0
         return 0.0
@@ -2423,6 +2525,10 @@ class HeuristicLayer:
 
         # 收集 mandatory_cargo 的 pickup 信息（用于过滤赶不到的候选）
         mandatory_pickups = self._build_mandatory_pickup_info(state, constraints, items)
+        mandatory_cargo_ids.update(
+            str(mp.get("cargo_id", "")) for mp in mandatory_pickups
+        )
+        mandatory_cargo_ids.discard("")
 
         for item in items:
             cargo = item.get("cargo", {})
@@ -2476,6 +2582,8 @@ class HeuristicLayer:
                 _skip_for_mandatory = False
                 for mp in mandatory_pickups:
                     deadline = mp.get("window_end", mp["activation_min"])
+                    if deadline < current_min:
+                        continue
                     # 远期（>12h）：不过滤，由 future_position_cost 惩罚
                     if deadline - current_min > 720:
                         continue
@@ -2487,6 +2595,16 @@ class HeuristicLayer:
                         break
                 if _skip_for_mandatory:
                     continue
+
+            # 过滤: 硬 daily_home_deadline 场景下，完单后必须能在当天 deadline 前回家。
+            if any(
+                c.get("type") == "daily_home_deadline"
+                and self.classify_constraint_severity(c) == "hard"
+                and self._violates_daily_home_deadline(
+                    end_lat, end_lng, _finish, current_min, c)
+                for c in constraints
+            ):
+                continue
 
             # 计算干线距离
             haul_km = haversine(start_lat, start_lng, end_lat, end_lng)
@@ -2534,7 +2652,7 @@ class HeuristicLayer:
 
             finish_min = current_min + total_time
             future_position_cost = self._future_position_cost(
-                end_lat, end_lng, finish_min,
+                end_lat, end_lng, finish_min, current_min,
                 constraints, state, horizon, mandatory_pickups,
             )
 
@@ -2948,6 +3066,7 @@ class MultiDriverCoordinationLayer:
         self.driver_profiles: dict[str, dict] = {}  # {driver_id: profile_dict}
         self.cargo_claim_history: dict[str, str] = {}  # {cargo_id: driver_id} 已被接的货
         self.active_decisions: dict[str, dict] = {}  # {driver_id: last_decision_info}
+        self.enable_competition_filter = False
 
     def register_driver_profile(self, driver_id: str, preferences_text: str,
                                 home_location: tuple[float, float] | None = None):
@@ -3017,6 +3136,8 @@ class MultiDriverCoordinationLayer:
 
     def filter_competitive_cargo(self, driver_id: str, candidates: list) -> list:
         """过滤已被其他司机接的货源（避免竞争）"""
+        if not self.enable_competition_filter:
+            return candidates
         filtered = []
         for item in candidates:
             cargo_id = str(item.get("cargo", {}).get("cargo_id", ""))
@@ -3130,8 +3251,16 @@ class ModelDecisionService:
             # 拒绝单次空驶 > 300km
             dist = haversine(cur_lat, cur_lng, lat, lng)
             if dist > _MAX_SINGLE_REPOSITION_KM:
-                self._logger.warning("安全闸拦截: reposition 距离 %.1fkm 超限，跳过该规则决策", dist)
-                return None
+                step_ratio = (_MAX_SINGLE_REPOSITION_KM * 0.9) / dist
+                lat = cur_lat + (lat - cur_lat) * step_ratio
+                lng = cur_lng + (lng - cur_lng) * step_ratio
+                params["latitude"] = round(lat, 6)
+                params["longitude"] = round(lng, 6)
+                dist = haversine(cur_lat, cur_lng, lat, lng)
+                self._logger.info(
+                    "reposition 距离超限，拆分为 %.1fkm 中间点 (%.5f, %.5f)",
+                    dist, lat, lng,
+                )
 
             # 拒绝执行后超 horizon
             travel_min = _distance_to_minutes(dist)
@@ -3192,6 +3321,38 @@ class ModelDecisionService:
 
         return chosen
 
+    @staticmethod
+    def _best_true_net(candidates: list[dict]) -> float:
+        if not candidates:
+            return float("-inf")
+        return max(float(c.get("true_net", c.get("score", 0))) for c in candidates)
+
+    def _validated_take_order_decision(
+        self,
+        candidate: dict,
+        items: list[dict],
+        status: dict,
+        constraints: list[dict],
+        state: "StateTracker",
+    ) -> dict | None:
+        """Build a take_order decision only after the same checks used by LLM output."""
+        cargo_id = str(candidate.get("cargo_id", ""))
+        if not cargo_id:
+            return None
+        if not self._validate_take_order_feasibility(cargo_id, items, status):
+            return None
+        ok, reason = self._validate_take_order_constraints(
+            cargo_id, items, status, constraints, state
+        )
+        if not ok:
+            self._logger.info(
+                "heuristic fast path rejected cargo=%s reason=%s",
+                cargo_id,
+                reason,
+            )
+            return None
+        return {"action": "take_order", "params": {"cargo_id": cargo_id}}
+
     def _validate_take_order_feasibility(self, cargo_id: str, items: list[dict],
                                           status: dict) -> bool:
         """校验 take_order 是否能在 horizon 内完成。"""
@@ -3222,6 +3383,70 @@ class ModelDecisionService:
             return current_min + total_time <= horizon
 
         return False  # 未找到 cargo 信息时拒绝（安全优先）
+
+    @staticmethod
+    def _build_scheduled_event_info(
+        state: "StateTracker", constraints: list[dict]
+    ) -> list[dict]:
+        open_events = [
+            t for t in (getattr(state, "open_tasks", []) or [])
+            if t.get("type") == "scheduled_event"
+        ]
+        if not open_events:
+            return []
+
+        constraint_params = [
+            c.get("params", {}) for c in constraints
+            if c.get("type") == "scheduled_event"
+            and isinstance(c.get("params", {}), dict)
+        ]
+        fallback = constraint_params[0] if constraint_params else {}
+        events: list[dict] = []
+
+        for task in open_events:
+            params = dict(fallback)
+            for key in (
+                "pickup_min",
+                "home_deadline_min",
+                "release_min",
+                "pickup_lat",
+                "pickup_lng",
+                "home_lat",
+                "home_lng",
+                "pickup_wait_minutes",
+            ):
+                if task.get(key) is not None:
+                    params[key] = task.get(key)
+            if params.get("home_deadline_min") is None and task.get("deadline_minute") is not None:
+                params["home_deadline_min"] = task.get("deadline_minute")
+
+            pickup_lat = params.get("pickup_lat")
+            pickup_lng = params.get("pickup_lng")
+            home_lat = params.get("home_lat")
+            home_lng = params.get("home_lng")
+            if None in (pickup_lat, pickup_lng, home_lat, home_lng):
+                continue
+
+            pickup_min = _to_int_or_zero(params.get("pickup_min"))
+            home_deadline = _to_int_or_zero(params.get("home_deadline_min"))
+            release_min = _to_int_or_zero(params.get("release_min")) or home_deadline
+            if pickup_min <= 0 or home_deadline <= 0:
+                continue
+            try:
+                events.append({
+                    "pickup_min": pickup_min,
+                    "home_deadline_min": home_deadline,
+                    "release_min": release_min,
+                    "pickup_lat": float(pickup_lat),
+                    "pickup_lng": float(pickup_lng),
+                    "home_lat": float(home_lat),
+                    "home_lng": float(home_lng),
+                    "pickup_wait_minutes": int(params.get("pickup_wait_minutes", 10) or 10),
+                })
+            except (TypeError, ValueError):
+                continue
+
+        return events
 
     def _validate_take_order_constraints(
         self,
@@ -3347,37 +3572,35 @@ class ModelDecisionService:
                     return False, "cannot_return_home_before_deadline"
                 # 软约束：允许通过，由评分层经济惩罚
 
-        # 7. scheduled_event：不能跨过事件时间窗（仅检查未完成的 open task）
-        _has_open_scheduled_event = any(
-            t.get("type") == "scheduled_event" for t in state.open_tasks
-        )
-        if _has_open_scheduled_event:
-            for c in constraints:
-                if c.get("type") != "scheduled_event":
-                    continue
-                p = c.get("params", {})
-                pickup_min = _to_int_or_zero(p.get("pickup_min"))
-                home_deadline = _to_int_or_zero(p.get("home_deadline_min"))
-                event_lat = p.get("pickup_lat")
-                event_lng = p.get("pickup_lng")
-                if event_lat is None or event_lng is None:
-                    continue
-                # 如果接单会跨过 pickup_min，且终点离事件点远，拒绝
-                if pickup_min > 0 and finish_min > pickup_min:
-                    travel_to_event = _distance_to_minutes(
-                        haversine(end_lat, end_lng, float(event_lat), float(event_lng))
-                    )
-                    if finish_min + travel_to_event > pickup_min + 120:
-                        return False, "order_crosses_event_pickup_window"
-                # 如果接单会跨过 home_deadline，且终点离家远
-                home_lat_c = p.get("home_lat")
-                home_lng_c = p.get("home_lng")
-                if home_deadline > 0 and finish_min > home_deadline and home_lat_c and home_lng_c:
-                    travel_home = _distance_to_minutes(
-                        haversine(end_lat, end_lng, float(home_lat_c), float(home_lng_c))
-                    )
-                    if finish_min + travel_home > home_deadline:
-                        return False, "order_crosses_event_home_deadline"
+        # 7. scheduled_event：订单结束后必须仍能完成 pickup -> home -> stay chain。
+        for event in self._build_scheduled_event_info(state, constraints):
+            home_deadline = event["home_deadline_min"]
+            release_min = event["release_min"]
+            if current_min >= release_min:
+                continue
+            if current_min >= home_deadline:
+                return False, "order_during_scheduled_event_stay"
+
+            travel_to_pickup = _distance_to_minutes(
+                haversine(
+                    end_lat,
+                    end_lng,
+                    event["pickup_lat"],
+                    event["pickup_lng"],
+                )
+            )
+            arrive_pickup = max(finish_min + travel_to_pickup, event["pickup_min"])
+            depart_pickup = arrive_pickup + event["pickup_wait_minutes"]
+            travel_home = _distance_to_minutes(
+                haversine(
+                    event["pickup_lat"],
+                    event["pickup_lng"],
+                    event["home_lat"],
+                    event["home_lng"],
+                )
+            )
+            if depart_pickup + travel_home > home_deadline:
+                return False, "order_would_miss_scheduled_event"
 
         # 8. monthly_visit：完单后能到达到访点（仅检查未完成的 open task）
         _has_open_visit = any(
@@ -3391,6 +3614,16 @@ class ModelDecisionService:
                 visit_lat = p.get("target_lat")
                 visit_lng = p.get("target_lng")
                 if visit_lat is None or visit_lng is None:
+                    continue
+                try:
+                    required_days = int(p.get("min_visit_days", 1))
+                except (TypeError, ValueError):
+                    required_days = 1
+                total_days = max(1, math.ceil(horizon / 1440))
+                current_day = current_min // 1440 + 1
+                remaining_days_after_today = max(0, total_days - current_day)
+                # 月度到访不是每天硬性任务；只有收官压力明显不足时才硬拒。
+                if total_days < required_days or remaining_days_after_today >= required_days:
                     continue
                 travel_to_visit = _distance_to_minutes(
                     haversine(end_lat, end_lng, float(visit_lat), float(visit_lng))
@@ -3423,6 +3656,8 @@ class ModelDecisionService:
         if _mandatory_pickups:
             for mp in _mandatory_pickups:
                 deadline = mp.get("window_end", mp["activation_min"])
+                if deadline < current_min:
+                    continue
                 if deadline - current_min > 720:
                     continue
                 travel_to_pickup = _distance_to_minutes(
@@ -3493,10 +3728,16 @@ class ModelDecisionService:
                     if (p.get("content") if isinstance(p, dict) else p)
                 )
             try:
-                plan = self._strategic_planner.generate_plan(
-                    driver_id, _prefs_text, constraints, status,
-                    horizon_minutes=horizon,
-                )
+                if horizon <= 2 * 1440:
+                    plan = self._strategic_planner._fallback_plan(
+                        constraints,
+                        horizon_minutes=horizon,
+                    )
+                else:
+                    plan = self._strategic_planner.generate_plan(
+                        driver_id, _prefs_text, constraints, status,
+                        horizon_minutes=horizon,
+                    )
                 state.set_strategic_plan(plan)
                 if state.monthly_planner is not None:
                     state.monthly_planner.integrate_strategic_plan(plan)
@@ -3711,6 +3952,49 @@ class ModelDecisionService:
 
         # 9. 快速接单路径：基于 true_net 的安全/吃罚候选分离
         _chosen = self._select_best_by_true_net(candidates)
+        best_true_net = self._best_true_net(candidates)
+        best_net_profit = max((float(c.get("net_profit", 0.0)) for c in candidates), default=0.0)
+        if _chosen is None or best_true_net <= 0 or best_net_profit <= 0:
+            wait_duration = min(60, max(1, remaining_min))
+            decision = {"action": "wait", "params": {"duration_minutes": wait_duration}}
+            self._logger.info(
+                "heuristic wait driver=%s best_true_net=%.1f best_net_profit=%.1f",
+                driver_id,
+                best_true_net,
+                best_net_profit,
+            )
+            self._update_state_after_decision(state, decision, current_min, candidates)
+            self.coordination_layer.record_decision(
+                driver_id,
+                "",
+                decision.get("action", ""),
+            )
+            return decision
+
+        _cid = _chosen["cargo_id"]
+        _chosen_tn = _chosen.get("true_net", _chosen["score"])
+        _chosen_profit = float(_chosen.get("net_profit", 0.0))
+        if _chosen.get("hard_penalty", 0) == 0 and _chosen_tn > 0 and _chosen_profit > 0:
+            decision = self._validated_take_order_decision(
+                _chosen, items, status_after_query, constraints, state
+            )
+            if decision is not None and not self._reviewer.should_review(
+                state, candidates, decision, current_min
+            ):
+                self._logger.info(
+                    "heuristic fast take_order driver=%s cargo=%s true_net=%.1f",
+                    driver_id,
+                    _cid,
+                    _chosen_tn,
+                )
+                self._update_state_after_decision(state, decision, current_min, candidates)
+                self.coordination_layer.record_decision(
+                    driver_id,
+                    decision.get("params", {}).get("cargo_id", ""),
+                    decision.get("action", ""),
+                )
+                return decision
+
         if _chosen is not None:
             _cid = _chosen["cargo_id"]
             _chosen_tn = _chosen.get("true_net", _chosen["score"])
@@ -3740,7 +4024,12 @@ class ModelDecisionService:
         # 10. Token 预算降级：超阈值时不调 LLM
         if state.is_token_budget_exceeded():
             _chosen = self._select_best_by_true_net(candidates)
-            if _chosen and _chosen.get("true_net", _chosen["score"]) > 0 and _chosen.get("hard_penalty", 0) == 0:
+            if (
+                _chosen
+                and _chosen.get("true_net", _chosen["score"]) > 0
+                and float(_chosen.get("net_profit", 0.0)) > 0
+                and _chosen.get("hard_penalty", 0) == 0
+            ):
                 _cid = _chosen["cargo_id"]
                 if self._validate_take_order_feasibility(_cid, items, status_after_query):
                     ok, reason = self._validate_take_order_constraints(
@@ -3766,7 +4055,12 @@ class ModelDecisionService:
         # 10.5 Token预算智能分配检查（Task #6）
         if not self.token_optimizer.should_use_llm(driver_id, _decision_complexity, _remaining_steps):
             _chosen = self._select_best_by_true_net(candidates)
-            if _chosen and _chosen.get("true_net", _chosen["score"]) > 0 and _chosen.get("hard_penalty", 0) == 0:
+            if (
+                _chosen
+                and _chosen.get("true_net", _chosen["score"]) > 0
+                and float(_chosen.get("net_profit", 0.0)) > 0
+                and _chosen.get("hard_penalty", 0) == 0
+            ):
                 _cid = _chosen["cargo_id"]
                 if self._validate_take_order_feasibility(_cid, items, status_after_query):
                     ok, reason = self._validate_take_order_constraints(
@@ -3995,9 +4289,19 @@ class ModelDecisionService:
                         try:
                             home_lat = float(home_lat)
                             home_lng = float(home_lng)
+                            radius_km = 1.0
+                            for c in constraints:
+                                if c.get("type") == "daily_home_deadline":
+                                    try:
+                                        radius_km = float(
+                                            c.get("params", {}).get("radius_km", radius_km)
+                                        )
+                                    except (ValueError, TypeError):
+                                        pass
+                                    break
+                            home_dist = haversine(cur_lat, cur_lng, home_lat, home_lng)
                             # 如果已经在家附近，等待
-                            if (abs(cur_lat - home_lat) < 0.02 and
-                                    abs(cur_lng - home_lng) < 0.02):
+                            if home_dist <= radius_km:
                                 return {
                                     "action": "wait",
                                     "params": {"duration_minutes": 30}

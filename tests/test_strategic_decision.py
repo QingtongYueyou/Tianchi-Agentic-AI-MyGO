@@ -40,6 +40,8 @@ from agent.model_decision_service import (
     StateTracker,
     MonthlyConstraintPlanner,
     HeuristicLayer,
+    RuleLayer,
+    MultiDriverCoordinationLayer,
     _get_day_index,
     haversine,
     _distance_to_minutes,
@@ -446,6 +448,85 @@ class TestMandatoryCargoPickupFilter:
         cargo_ids = [c["cargo_id"] for c in result]
         assert "C_NORMAL" in cargo_ids, "无 mandatory 任务时不应过滤普通候选"
 
+    def test_constraint_fallback_blocks_order_crossing_mandatory_activation(self):
+        api = type("FakeApi", (), {"model_chat_completion": lambda self, *a, **kw: {}})()
+        svc = ModelDecisionService(api)
+        state = StateTracker()
+        status = {
+            "simulation_progress_minutes": 1000,
+            "simulation_horizon_minutes": 43200,
+            "current_lat": 23.0,
+            "current_lng": 114.0,
+        }
+        constraints = [{
+            "type": "mandatory_cargo",
+            "params": {
+                "cargo_id": "MAND001",
+                "activation_min": 1100,
+                "pickup_lat": 23.0,
+                "pickup_lng": 114.0,
+            },
+        }]
+        items = [{
+            "distance_km": 0.0,
+            "cargo": {
+                "cargo_id": "C_OTHER",
+                "cargo_name": "general",
+                "price": 1000,
+                "cost_time_minutes": 120,
+                "start": {"lat": 23.0, "lng": 114.0},
+                "end": {"lat": 22.0, "lng": 113.0},
+                "load_time": None,
+            },
+        }]
+
+        ok, reason = svc._validate_take_order_constraints(
+            "C_OTHER", items, status, constraints, state
+        )
+
+        assert ok is False
+        assert reason == "order_would_miss_mandatory_cargo"
+
+    def test_completed_mandatory_constraint_does_not_keep_blocking_orders(self):
+        api = type("FakeApi", (), {"model_chat_completion": lambda self, *a, **kw: {}})()
+        svc = ModelDecisionService(api)
+        state = StateTracker()
+        state.completed_tasks = [{"type": "mandatory_cargo", "target": "MAND001"}]
+        status = {
+            "simulation_progress_minutes": 1000,
+            "simulation_horizon_minutes": 43200,
+            "current_lat": 23.0,
+            "current_lng": 114.0,
+        }
+        constraints = [{
+            "type": "mandatory_cargo",
+            "params": {
+                "cargo_id": "MAND001",
+                "activation_min": 1100,
+                "pickup_lat": 23.0,
+                "pickup_lng": 114.0,
+            },
+        }]
+        items = [{
+            "distance_km": 0.0,
+            "cargo": {
+                "cargo_id": "C_OTHER",
+                "cargo_name": "general",
+                "price": 1000,
+                "cost_time_minutes": 120,
+                "start": {"lat": 23.0, "lng": 114.0},
+                "end": {"lat": 22.0, "lng": 113.0},
+                "load_time": None,
+            },
+        }]
+
+        ok, reason = svc._validate_take_order_constraints(
+            "C_OTHER", items, status, constraints, state
+        )
+
+        assert ok is True
+        assert reason == ""
+
 
 # ═══════════════════════════════════════════════════════════════
 # Problem 2: scheduled_event 保守完成判断
@@ -677,6 +758,107 @@ class TestTakeOrderConstraintValidation:
 
         assert ok is False
         assert reason == "violates_time_restriction"
+
+    def test_scheduled_event_rejects_order_that_cannot_complete_pickup_home_chain(self):
+        svc = self._make_service()
+        state = StateTracker()
+        state.open_tasks = [{
+            "type": "scheduled_event",
+            "target": "event",
+            "pickup_min": 13560,
+            "home_deadline_min": 13680,
+            "release_min": 18000,
+            "pickup_lat": 23.21,
+            "pickup_lng": 113.37,
+            "home_lat": 23.19,
+            "home_lng": 113.36,
+            "pickup_wait_minutes": 10,
+        }]
+        status = {
+            "simulation_progress_minutes": 13140,
+            "simulation_horizon_minutes": 43200,
+            "current_lat": 23.10,
+            "current_lng": 113.20,
+        }
+        constraints = [{
+            "type": "scheduled_event",
+            "params": {
+                "pickup_min": 13560,
+                "home_deadline_min": 13680,
+                "release_min": 18000,
+                "pickup_lat": 23.21,
+                "pickup_lng": 113.37,
+                "home_lat": 23.19,
+                "home_lng": 113.36,
+                "pickup_wait_minutes": 10,
+            },
+        }]
+        items = [{
+            "distance_km": 0.0,
+            "cargo": {
+                "cargo_id": "C1",
+                "price": 1000,
+                "cost_time_minutes": 485,
+                "start": {"lat": 23.10, "lng": 113.20},
+                "end": {"lat": 22.83, "lng": 113.94},
+                "load_time": None,
+            },
+        }]
+
+        ok, reason = svc._validate_take_order_constraints(
+            "C1", items, status, constraints, state
+        )
+
+        assert ok is False
+        assert reason == "order_would_miss_scheduled_event"
+
+    def test_scheduled_event_allows_short_order_when_chain_still_fits(self):
+        svc = self._make_service()
+        state = StateTracker()
+        state.open_tasks = [{
+            "type": "scheduled_event",
+            "target": "event",
+            "pickup_min": 13560,
+            "home_deadline_min": 13680,
+            "release_min": 18000,
+        }]
+        status = {
+            "simulation_progress_minutes": 13140,
+            "simulation_horizon_minutes": 43200,
+            "current_lat": 23.10,
+            "current_lng": 113.20,
+        }
+        constraints = [{
+            "type": "scheduled_event",
+            "params": {
+                "pickup_min": 13560,
+                "home_deadline_min": 13680,
+                "release_min": 18000,
+                "pickup_lat": 23.21,
+                "pickup_lng": 113.37,
+                "home_lat": 23.19,
+                "home_lng": 113.36,
+                "pickup_wait_minutes": 10,
+            },
+        }]
+        items = [{
+            "distance_km": 0.0,
+            "cargo": {
+                "cargo_id": "C1",
+                "price": 1000,
+                "cost_time_minutes": 60,
+                "start": {"lat": 23.10, "lng": 113.20},
+                "end": {"lat": 23.20, "lng": 113.37},
+                "load_time": None,
+            },
+        }]
+
+        ok, reason = svc._validate_take_order_constraints(
+            "C1", items, status, constraints, state
+        )
+
+        assert ok is True
+        assert reason == ""
 
 
 class TestFuturePositionCost:
@@ -954,3 +1136,292 @@ class TestEstimateWaitValue:
             23 * 60, state, [], 43200)
         # 应为负（夜间无货，时间成本 + 夜间惩罚）
         assert val < 0, "深夜无需求时 wait_value 应为负"
+
+
+class TestDailyHomeDeadlineFixes:
+    """每日回家 deadline 应使用真实距离，并在启发式层过滤不可回家订单。"""
+
+    def _make_service(self):
+        api = type("FakeApi", (), {
+            "model_chat_completion": lambda self, *a, **kw: {},
+        })()
+        return ModelDecisionService(api)
+
+    def test_urgent_home_uses_km_radius_not_degree_box(self):
+        svc = self._make_service()
+        state = StateTracker()
+        task = {
+            "type": "daily_home_deadline",
+            "home_lat": 23.12,
+            "home_lng": 113.28,
+            "deadline_hour": 23,
+            "priority": 2,
+        }
+        status = {
+            "simulation_progress_minutes": 22 * 60 + 38,
+            "current_lat": 23.11,
+            "current_lng": 113.26,
+        }
+        constraints = [{
+            "type": "daily_home_deadline",
+            "params": {
+                "home_lat": 23.12,
+                "home_lng": 113.28,
+                "deadline_hour": 23,
+                "radius_km": 1.0,
+            },
+            "penalty_amount": 900,
+            "severity": "hard",
+        }]
+
+        decision = svc._handle_urgent_tasks([task], status, state, constraints)
+
+        assert decision["action"] == "reposition"
+
+    def test_score_filters_orders_that_cannot_return_home(self):
+        state = StateTracker()
+        layer = HeuristicLayer()
+        status = {
+            "simulation_progress_minutes": 22 * 60,
+            "simulation_horizon_minutes": 1440,
+        }
+        constraints = [{
+            "type": "daily_home_deadline",
+            "params": {
+                "home_lat": 23.12,
+                "home_lng": 113.28,
+                "deadline_hour": 23,
+            },
+            "penalty_amount": 900,
+            "severity": "hard",
+        }]
+        items = [
+            {
+                "distance_km": 1.0,
+                "cargo": {
+                    "cargo_id": "FAR_HOME",
+                    "cargo_name": "general",
+                    "price": 1000,
+                    "cost_time_minutes": 60,
+                    "start": {"lat": 23.12, "lng": 113.28},
+                    "end": {"lat": 22.0, "lng": 114.5},
+                    "load_time": None,
+                },
+            },
+            {
+                "distance_km": 1.0,
+                "cargo": {
+                    "cargo_id": "NEAR_HOME",
+                    "cargo_name": "general",
+                    "price": 200,
+                    "cost_time_minutes": 10,
+                    "start": {"lat": 23.12, "lng": 113.28},
+                    "end": {"lat": 23.12, "lng": 113.28},
+                    "load_time": None,
+                },
+            },
+        ]
+
+        result = layer.score_and_rank(items, status, state, constraints, top_n=5)
+        cargo_ids = [c["cargo_id"] for c in result]
+
+        assert "FAR_HOME" not in cargo_ids
+        assert "NEAR_HOME" in cargo_ids
+        assert result[0]["hard_penalty"] == 0
+
+
+class TestContinuousRestFixes:
+    """连续休息应补足当前连续段，而不是补足分散历史总量。"""
+
+    def test_forced_rest_continues_existing_wait_streak(self):
+        state = StateTracker()
+        state.record_wait(0, 360)
+        layer = RuleLayer()
+        constraints = [{
+            "type": "daily_rest",
+            "severity": "soft",
+            "params": {"min_continuous_minutes": 480},
+            "penalty_amount": 300,
+        }]
+
+        decision = layer._check_forced_rest(360, state, constraints, 1440)
+
+        assert decision == {"action": "wait", "params": {"duration_minutes": 120}}
+
+    def test_forced_rest_continues_across_midnight_without_query_gap(self):
+        state = StateTracker()
+        state.record_wait(2700, 180)
+        layer = RuleLayer()
+        constraints = [{
+            "type": "daily_rest",
+            "severity": "soft",
+            "params": {"min_continuous_minutes": 240},
+            "penalty_amount": 300,
+        }]
+
+        decision = layer._check_forced_rest(2880, state, constraints, 4320)
+
+        assert decision == {"action": "wait", "params": {"duration_minutes": 240}}
+
+
+class TestRepositionSafety:
+    """Long required reposition actions should progress in safe legs."""
+
+    def test_long_reposition_is_split_instead_of_dropped(self):
+        api = type("FakeApi", (), {"model_chat_completion": lambda self, *a, **kw: {}})()
+        svc = ModelDecisionService(api)
+        status = {
+            "simulation_progress_minutes": 0,
+            "simulation_horizon_minutes": 10000,
+            "current_lat": 23.73,
+            "current_lng": 116.16,
+        }
+        decision = {
+            "action": "reposition",
+            "params": {"latitude": 23.13, "longitude": 113.26},
+        }
+
+        validated = svc._validate_action(decision, status, [])
+
+        assert validated is not None
+        params = validated["params"]
+        leg_km = haversine(
+            status["current_lat"],
+            status["current_lng"],
+            params["latitude"],
+            params["longitude"],
+        )
+        assert leg_km <= 300.0
+        assert params["latitude"] != 23.13 or params["longitude"] != 113.26
+
+
+class TestMonthlyVisitValidationRelaxed:
+    """月度到访在非收官阶段不应每天硬拒订单。"""
+
+    def test_monthly_visit_not_hard_rejected_early_in_month(self):
+        api = type("FakeApi", (), {
+            "model_chat_completion": lambda self, *a, **kw: {},
+        })()
+        svc = ModelDecisionService(api)
+        state = StateTracker()
+        state.open_tasks = [{
+            "type": "monthly_visit",
+            "target": "lat=23.13,lng=113.26",
+            "min_visit_days": 5,
+            "deadline_minute": 43200,
+        }]
+        status = {
+            "simulation_progress_minutes": 600,
+            "simulation_horizon_minutes": 43200,
+            "current_lat": 23.12,
+            "current_lng": 113.28,
+        }
+        constraints = [{
+            "type": "monthly_visit_requirement",
+            "params": {
+                "target_lat": 23.13,
+                "target_lng": 113.26,
+                "min_visit_days": 5,
+            },
+        }]
+        items = [{
+            "distance_km": 1.0,
+            "cargo": {
+                "cargo_id": "C1",
+                "price": 1000,
+                "cost_time_minutes": 1000,
+                "start": {"lat": 23.12, "lng": 113.28},
+                "end": {"lat": 22.0, "lng": 114.5},
+                "load_time": None,
+            },
+        }]
+
+        ok, reason = svc._validate_take_order_constraints(
+            "C1", items, status, constraints, state)
+
+        assert ok is True
+        assert reason == ""
+
+
+class TestCoordinationLayerDefault:
+    """离线独立司机评测下，默认不跨司机过滤货源。"""
+
+    def test_competition_filter_is_disabled_by_default(self):
+        layer = MultiDriverCoordinationLayer()
+        layer.record_decision("D001", "C1", "take_order")
+        items = [
+            {"cargo": {"cargo_id": "C1"}},
+            {"cargo": {"cargo_id": "C2"}},
+        ]
+
+        result = layer.filter_competitive_cargo("D002", items)
+
+        assert result == items
+
+
+class TestShortRunFastDecision:
+    """Short simulations should not call the model for obvious heuristic decisions."""
+
+    class NoModelApi:
+        def __init__(self, item):
+            self.model_calls = 0
+            self.item = item
+            self.status = {
+                "driver_id": "D_TEST",
+                "current_lat": 23.0,
+                "current_lng": 113.0,
+                "preferences": [],
+                "simulation_progress_minutes": 0,
+                "simulation_horizon_minutes": 1440,
+            }
+
+        def model_chat_completion(self, payload):
+            self.model_calls += 1
+            raise AssertionError("model should not be called")
+
+        def get_driver_status(self, driver_id):
+            return dict(self.status)
+
+        def query_decision_history(self, driver_id, step):
+            return {"records": []}
+
+        def query_cargo(self, driver_id, latitude, longitude):
+            return {"items": [self.item]}
+
+    @staticmethod
+    def _item(price):
+        return {
+            "distance_km": 1.0,
+            "cargo": {
+                "cargo_id": "C_FAST",
+                "cargo_name": "general",
+                "price": price,
+                "cost_time_minutes": 30,
+                "start": {"lat": 23.0, "lng": 113.0},
+                "end": {"lat": 23.01, "lng": 113.01},
+                "load_time": None,
+            },
+        }
+
+    def test_positive_true_net_uses_heuristic_take_order(self):
+        api = self.NoModelApi(self._item(price=1000))
+        svc = ModelDecisionService(api)
+        svc._preference_engine.get_constraints = lambda driver_id, prefs: []
+
+        decision = svc.decide("D_TEST")
+
+        assert decision == {"action": "take_order", "params": {"cargo_id": "C_FAST"}}
+        assert api.model_calls == 0
+
+    def test_non_positive_true_net_waits_without_model(self):
+        item = self._item(price=1)
+        item["distance_km"] = 200.0
+        item["cargo"]["end"] = {"lat": 25.0, "lng": 115.0}
+        api = self.NoModelApi(item)
+        svc = ModelDecisionService(api)
+        svc._preference_engine.get_constraints = lambda driver_id, prefs: []
+
+        decision = svc.decide("D_TEST")
+
+        assert decision["action"] == "wait"
+        assert api.model_calls == 0
