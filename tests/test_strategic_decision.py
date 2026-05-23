@@ -40,6 +40,7 @@ from agent.model_decision_service import (
     StateTracker,
     MonthlyConstraintPlanner,
     HeuristicLayer,
+    ProfitSearchLayer,
     RuleLayer,
     MultiDriverCoordinationLayer,
     _get_day_index,
@@ -293,6 +294,23 @@ class TestUrgentTaskDeferral:
         }]
 
         assert state.has_urgent_tasks(900) == []
+
+    def test_expired_mandatory_cargo_is_not_urgent(self):
+        state = StateTracker()
+        state.open_tasks = [{
+            "type": "mandatory_cargo",
+            "target": "240646",
+            "activation_min": 3763,
+            "window_end": 3848,
+            "deadline_minute": 44640,
+            "priority": 1,
+        }]
+
+        state.update_task_progress(3900, [])
+
+        assert state.has_urgent_tasks(3900) == []
+        assert state.open_tasks == []
+        assert state.completed_tasks[0]["expired"] is True
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -916,6 +934,69 @@ class TestFuturePositionCost:
         assert by_id["NEAR_HOME"]["future_position_cost"] < by_id["FAR_HOME"]["future_position_cost"]
 
 
+class TestProfitSearchLayer:
+    """Profit search should optimize constrained downstream profit, not only immediate true_net."""
+
+    def test_downstream_value_can_beat_higher_immediate_true_net(self):
+        state = StateTracker()
+        state.spatial_income[(240, 1140)] = 12000.0
+        layer = ProfitSearchLayer()
+        status = {"simulation_progress_minutes": 0, "simulation_horizon_minutes": 1440}
+        candidates = [
+            {
+                "cargo_id": "COLD",
+                "true_net": 500.0,
+                "score": 500.0,
+                "net_profit": 500.0,
+                "total_minutes": 60,
+                "deadhead_km": 1.0,
+                "has_soft_penalty": False,
+                "end": {"lat": 23.0, "lng": 113.0},
+            },
+            {
+                "cargo_id": "HOT",
+                "true_net": 430.0,
+                "score": 430.0,
+                "net_profit": 430.0,
+                "total_minutes": 60,
+                "deadhead_km": 1.0,
+                "has_soft_penalty": False,
+                "end": {"lat": 24.0, "lng": 114.0},
+            },
+        ]
+
+        ranked = layer.rank_candidates(candidates, status, state, [], None)
+        best = layer.select_best(ranked)
+
+        assert best is not None
+        assert best["cargo_id"] == "HOT"
+        assert best["downstream_value"] > 0
+        assert best["profit_search_score"] > ranked[1]["profit_search_score"]
+
+    def test_late_overnight_long_order_gets_large_risk_cost(self):
+        layer = ProfitSearchLayer()
+        state = StateTracker()
+        status = {
+            "simulation_progress_minutes": 8 * 1440 + 21 * 60,
+            "simulation_horizon_minutes": 43200,
+        }
+        candidates = [{
+            "cargo_id": "OVERNIGHT",
+            "true_net": 2000.0,
+            "score": 2000.0,
+            "net_profit": 2000.0,
+            "total_minutes": 900,
+            "deadhead_km": 1.0,
+            "has_soft_penalty": False,
+            "end": {"lat": 23.0, "lng": 113.0},
+        }]
+
+        ranked = layer.rank_candidates(candidates, status, state, [], None)
+
+        assert ranked[0]["overnight_risk_cost"] >= 6000
+        assert ranked[0]["profit_search_score"] < 0
+
+
 # ═══════════════════════════════════════════════════════════════
 # true_net 重构测试
 # ═══════════════════════════════════════════════════════════════
@@ -1429,6 +1510,73 @@ class TestRuntimeConstraintTaskSync:
         assert decision["params"] == {"latitude": 23.19, "longitude": 113.36}
         assert task["pickup_wait_done"] is True
 
+    def test_scheduled_event_does_not_pin_driver_before_travel_start(self):
+        api = type("FakeApi", (), {"model_chat_completion": lambda self, *a, **kw: {}})()
+        svc = ModelDecisionService(api)
+        state = StateTracker()
+        task = {
+            "type": "scheduled_event",
+            "pickup_min": 13560,
+            "home_deadline_min": 13680,
+            "release_min": 17880,
+            "deadline_minute": 13680,
+            "pickup_lat": 23.21,
+            "pickup_lng": 113.37,
+            "home_lat": 23.19,
+            "home_lng": 113.36,
+            "pickup_wait_minutes": 10,
+            "priority": 1,
+        }
+        state.open_tasks = [task]
+
+        decision = svc._handle_urgent_tasks(
+            state.has_urgent_tasks(13140),
+            {
+                "simulation_progress_minutes": 13140,
+                "current_lat": 23.65,
+                "current_lng": 113.10,
+            },
+            state,
+            [],
+        )
+
+        assert decision is None
+
+    def test_scheduled_event_starts_by_travel_time_before_pickup(self):
+        api = type("FakeApi", (), {"model_chat_completion": lambda self, *a, **kw: {}})()
+        svc = ModelDecisionService(api)
+        state = StateTracker()
+        task = {
+            "type": "scheduled_event",
+            "pickup_min": 13560,
+            "home_deadline_min": 13680,
+            "release_min": 17880,
+            "deadline_minute": 13680,
+            "pickup_lat": 23.21,
+            "pickup_lng": 113.37,
+            "home_lat": 23.19,
+            "home_lng": 113.36,
+            "pickup_wait_minutes": 10,
+            "priority": 1,
+        }
+        state.open_tasks = [task]
+
+        decision = svc._handle_urgent_tasks(
+            state.has_urgent_tasks(13490),
+            {
+                "simulation_progress_minutes": 13490,
+                "current_lat": 23.65,
+                "current_lng": 113.10,
+            },
+            state,
+            [],
+        )
+
+        assert decision == {
+            "action": "reposition",
+            "params": {"latitude": 23.21, "longitude": 113.37},
+        }
+
     def test_active_mandatory_cargo_at_pickup_allows_cargo_query(self):
         api = type("FakeApi", (), {"model_chat_completion": lambda self, *a, **kw: {}})()
         svc = ModelDecisionService(api)
@@ -1624,7 +1772,7 @@ class TestShortRunFastDecision:
     class NoModelApi:
         def __init__(self, item):
             self.model_calls = 0
-            self.item = item
+            self.items = item if isinstance(item, list) else [item]
             self.status = {
                 "driver_id": "D_TEST",
                 "current_lat": 23.0,
@@ -1645,19 +1793,19 @@ class TestShortRunFastDecision:
             return {"records": []}
 
         def query_cargo(self, driver_id, latitude, longitude):
-            return {"items": [self.item]}
+            return {"items": self.items}
 
     @staticmethod
-    def _item(price):
+    def _item(price, cargo_id="C_FAST", end_lat=23.01, end_lng=113.01):
         return {
             "distance_km": 1.0,
             "cargo": {
-                "cargo_id": "C_FAST",
+                "cargo_id": cargo_id,
                 "cargo_name": "general",
                 "price": price,
                 "cost_time_minutes": 30,
                 "start": {"lat": 23.0, "lng": 113.0},
-                "end": {"lat": 23.01, "lng": 113.01},
+                "end": {"lat": end_lat, "lng": end_lng},
                 "load_time": None,
             },
         }
@@ -1670,6 +1818,22 @@ class TestShortRunFastDecision:
         decision = svc.decide("D_TEST")
 
         assert decision == {"action": "take_order", "params": {"cargo_id": "C_FAST"}}
+        assert api.model_calls == 0
+
+    def test_profit_search_prefers_downstream_hot_area_without_model(self):
+        cold = self._item(price=1100, cargo_id="C_COLD", end_lat=23.0, end_lng=113.0)
+        hot = self._item(price=980, cargo_id="C_HOT", end_lat=23.1, end_lng=113.1)
+        api = self.NoModelApi([cold, hot])
+        svc = ModelDecisionService(api)
+        svc._preference_engine.get_constraints = lambda driver_id, prefs: []
+        state = StateTracker()
+        state.spatial_income[(231, 1131)] = 12000.0
+        state.refresh_from_history = lambda api_obj, driver_id: None
+        svc._state_tracker["D_TEST"] = state
+
+        decision = svc.decide("D_TEST")
+
+        assert decision == {"action": "take_order", "params": {"cargo_id": "C_HOT"}}
         assert api.model_calls == 0
 
     def test_non_positive_true_net_waits_without_model(self):

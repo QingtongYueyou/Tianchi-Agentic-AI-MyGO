@@ -547,6 +547,11 @@ class StateTracker:
         for task in self.open_tasks:
             task_type = task.get("type", "")
             if task_type == "mandatory_cargo":
+                window_end = _to_int_or_zero(task.get("window_end"))
+                if window_end > 0 and current_min > window_end:
+                    task["expired"] = True
+                    newly_completed.append(task)
+                    continue
                 # 检查历史中是否接了指定 cargo_id（嵌套结构: rec.action.params.cargo_id）
                 target_cargo = str(task.get("target", ""))
                 for h in history:
@@ -726,6 +731,9 @@ class StateTracker:
                 continue
             if task_type == "mandatory_cargo":
                 activation = _to_int_or_zero(task.get("activation_min"))
+                window_end = _to_int_or_zero(task.get("window_end"))
+                if window_end > 0 and current_min > window_end:
+                    continue
                 if activation > 0:
                     if current_min >= activation or 0 < activation - current_min < 180:
                         urgent.append(task)
@@ -1497,6 +1505,169 @@ class OpportunityPredictor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ProfitSearchLayer - 受约束短视野利润搜索层
+# ─────────────────────────────────────────────────────────────────────────────
+class ProfitSearchLayer:
+    """在启发式 TopK 内重排候选，偏向长期利润而非单步收益。"""
+
+    def rank_candidates(
+        self,
+        candidates: list[dict],
+        status: dict,
+        state: StateTracker,
+        constraints: list[dict],
+        opportunity_predictor: OpportunityPredictor | None = None,
+    ) -> list[dict]:
+        if not candidates:
+            return []
+
+        current_min = int(status.get("simulation_progress_minutes", 0))
+        horizon = _get_horizon_minutes(status)
+        ranked: list[dict] = []
+
+        for candidate in candidates:
+            item = dict(candidate)
+            base = float(item.get("true_net", item.get("score", 0.0)) or 0.0)
+            downstream = self._downstream_value(
+                item, current_min, horizon, state, opportunity_predictor)
+            turnover = self._turnover_bonus(item)
+            overnight_risk = self._overnight_long_order_risk_cost(item, current_min)
+            search_score = base + downstream + turnover - overnight_risk
+            item["downstream_value"] = round(downstream, 2)
+            item["turnover_bonus"] = round(turnover, 2)
+            item["overnight_risk_cost"] = round(overnight_risk, 2)
+            item["profit_search_score"] = round(search_score, 4)
+            ranked.append(item)
+
+        ranked.sort(key=self._candidate_value, reverse=True)
+        return ranked
+
+    def select_best(self, candidates: list[dict]) -> dict | None:
+        """按 profit_search_score 选择最佳候选，同时保留吃罚/长单/大空驶保护。"""
+        if not candidates:
+            return None
+
+        safe = [c for c in candidates if not c.get("has_soft_penalty", False)]
+        penalty = [c for c in candidates if c.get("has_soft_penalty", False)]
+
+        best_safe = max(safe, key=self._candidate_value) if safe else None
+        best_penalty = max(penalty, key=self._candidate_value) if penalty else None
+
+        chosen = None
+        if best_penalty and best_safe:
+            pn = self._candidate_value(best_penalty)
+            sn = self._candidate_value(best_safe)
+            chosen = best_penalty if pn > sn + _PENALTY_MARGIN else best_safe
+        elif best_safe:
+            chosen = best_safe
+        elif best_penalty:
+            chosen = best_penalty
+
+        if chosen is None:
+            return None
+
+        value = self._candidate_value(chosen)
+        if chosen["total_minutes"] > 600 and value < _LONG_ORDER_REJECT_TRUE_NET:
+            return None
+        if chosen["deadhead_km"] > _EXTREME_DEADHEAD_KM and value < _DEADHEAD_REJECT_TRUE_NET:
+            return None
+        return chosen
+
+    @staticmethod
+    def _candidate_value(candidate: dict) -> float:
+        return float(candidate.get(
+            "profit_search_score",
+            candidate.get("true_net", candidate.get("score", 0.0)),
+        ) or 0.0)
+
+    def _downstream_value(
+        self,
+        candidate: dict,
+        current_min: int,
+        horizon: int,
+        state: StateTracker,
+        opportunity_predictor: OpportunityPredictor | None,
+    ) -> float:
+        end = candidate.get("end", {})
+        end_lat = end.get("lat")
+        end_lng = end.get("lng")
+        if end_lat is None or end_lng is None:
+            return 0.0
+
+        finish_min = current_min + int(candidate.get("total_minutes", 0) or 0)
+        remaining_hours = max(0.0, (horizon - finish_min) / 60.0)
+        if remaining_hours <= 0:
+            return 0.0
+
+        time_factor = min(1.0, remaining_hours / 4.0)
+        spatial = self._spatial_value(float(end_lat), float(end_lng), state)
+        forecast = self._forecast_value(
+            _get_hour_of_day(finish_min), opportunity_predictor)
+        return (spatial + forecast) * time_factor
+
+    @staticmethod
+    def _spatial_value(end_lat: float, end_lng: float, state: StateTracker) -> float:
+        grid_key = (round(end_lat * 10), round(end_lng * 10))
+        direct = float(state.spatial_income.get(grid_key, 0.0))
+        neighbor = 0.0
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                neighbor += float(state.spatial_income.get(
+                    (grid_key[0] + dx, grid_key[1] + dy), 0.0))
+        return min(240.0, direct * 0.015 + neighbor * 0.004)
+
+    @staticmethod
+    def _forecast_value(
+        finish_hour: float,
+        opportunity_predictor: OpportunityPredictor | None,
+    ) -> float:
+        if opportunity_predictor is None:
+            return 0.0
+        try:
+            prediction = opportunity_predictor.predict_next_hours(finish_hour, 2)
+        except Exception:
+            return 0.0
+
+        best = 0.0
+        for data in prediction.values():
+            try:
+                expected_price = float(data.get("expected_avg_price", 0.0))
+                expected_count = float(data.get("expected_count", 0.0))
+            except (TypeError, ValueError):
+                continue
+            density = min(1.0, expected_count / 3.0)
+            best = max(best, expected_price * density * 0.18)
+        return min(180.0, best)
+
+    @staticmethod
+    def _turnover_bonus(candidate: dict) -> float:
+        profit = max(0.0, float(candidate.get("net_profit", 0.0) or 0.0))
+        minutes = max(1, int(candidate.get("total_minutes", 1) or 1))
+        hourly_profit = profit * 60.0 / minutes
+        return min(180.0, hourly_profit * 0.12)
+
+    @staticmethod
+    def _overnight_long_order_risk_cost(candidate: dict, current_min: int) -> float:
+        """Price unknown next-day obligations when a late order blocks the morning."""
+        total_minutes = int(candidate.get("total_minutes", 0) or 0)
+        if total_minutes <= 600:
+            return 0.0
+        current_hour = _get_hour_of_day(current_min)
+        if current_hour < 18.0:
+            return 0.0
+        current_day = _get_day_index(current_min)
+        finish_min = current_min + total_minutes
+        if _get_day_index(finish_min) <= current_day:
+            return 0.0
+        next_day_ten = (current_day + 1) * 1440 + 10 * 60
+        if finish_min <= next_day_ten:
+            return 0.0
+        return min(12000.0, 6000.0 + (total_minutes - 600) * 3.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ProactiveRepositionLayer - 主动空驶策略层 (Task #5)
 # ─────────────────────────────────────────────────────────────────────────────
 class ProactiveRepositionLayer:
@@ -1750,13 +1921,16 @@ class RuleLayer:
             return None
         lat = float(status.get("current_lat", 0))
         lng = float(status.get("current_lng", 0))
-        prep_start = pickup_min - 24 * 60
-
-        if prep_start <= current_min < pickup_min:
+        if current_min < pickup_min:
             dist = haversine(lat, lng, float(pickup_lat), float(pickup_lng))
-            if dist > 1.0:
+            travel_min = _distance_to_minutes(dist)
+            pickup_wait = int(params.get("pickup_wait_minutes", 10))
+            prep_buffer = max(15, min(60, pickup_wait + 5))
+            if dist > 1.0 and current_min + travel_min + prep_buffer >= pickup_min:
                 return self._reposition(float(pickup_lat), float(pickup_lng))
-            return self._wait(min(60, pickup_min - current_min))
+            if dist <= 1.0 and pickup_min - current_min <= prep_buffer:
+                return self._wait(min(60, pickup_min - current_min))
+            return None
 
         if pickup_min <= current_min < deadline:
             pickup_dist = haversine(lat, lng, float(pickup_lat), float(pickup_lng))
@@ -3255,6 +3429,7 @@ class ModelDecisionService:
         # Task #4: 历史模式分析器、未来机会预测器
         self.pattern_analyzer = HistoryPatternAnalyzer()
         self.opportunity_predictor = OpportunityPredictor()
+        self.profit_search_layer = ProfitSearchLayer()
         # Task #5: 主动空驶层
         self.reposition_layer = ProactiveRepositionLayer()
         # 已经从历史填充过 pattern_analyzer 的 driver 集合
@@ -3308,6 +3483,12 @@ class ModelDecisionService:
 
         def add_once(task: dict) -> None:
             key = self._task_key(task)
+            for existing in state.open_tasks:
+                if self._task_key(existing) == key:
+                    for field, value in task.items():
+                        if value is not None:
+                            existing[field] = value
+                    return
             if key in known:
                 return
             state.open_tasks.append(task)
@@ -3945,8 +4126,15 @@ class ModelDecisionService:
             else:
                 # 无货源数据时拒绝 take_order：无法校验 cargo 存在性、可见性、时效
                 if rule_decision.get("action") == "take_order":
-                    self._logger.info("规则层(无货源) 产出 take_order 但无法校验，跳过等查货后处理 driver=%s", driver_id)
-                    rule_decision = None
+                    cargo_id = str(rule_decision.get("params", {}).get("cargo_id", ""))
+                    mandatory_ids = {
+                        str(t.get("target") or t.get("cargo_id") or "")
+                        for t in state.open_tasks
+                        if t.get("type") == "mandatory_cargo"
+                    }
+                    if cargo_id not in mandatory_ids:
+                        self._logger.info("规则层(无货源) 产出 take_order 但无法校验，跳过等查货后处理 driver=%s", driver_id)
+                        rule_decision = None
                 if rule_decision is not None:
                     self._logger.info("规则层决策 driver=%s action=%s", driver_id, rule_decision.get("action"))
                     self._update_state_after_decision(state, rule_decision, current_min)
@@ -4180,6 +4368,10 @@ class ModelDecisionService:
             return decision
 
         # 评估决策复杂度（供 reviewer 和 token_optimizer 使用）
+        candidates = self.profit_search_layer.rank_candidates(
+            candidates, status_after_query, state, constraints,
+            self.opportunity_predictor,
+        )
         _decision_complexity = "low"
         if len(candidates) > 3:
             _decision_complexity = "medium"
@@ -4194,16 +4386,21 @@ class ModelDecisionService:
         # 同步 StateTracker 的 token 用量到 token_optimizer
         self.token_optimizer.usage_tracker[driver_id] = state.total_tokens_used
 
-        # 9. 快速接单路径：基于 true_net 的安全/吃罚候选分离
-        _chosen = self._select_best_by_true_net(candidates)
+        # 9. 快速接单路径：基于短视野利润搜索的安全/吃罚候选分离
+        _chosen = self.profit_search_layer.select_best(candidates)
         best_true_net = self._best_true_net(candidates)
+        best_profit_score = (
+            ProfitSearchLayer._candidate_value(_chosen)
+            if _chosen is not None else float("-inf")
+        )
         best_net_profit = max((float(c.get("net_profit", 0.0)) for c in candidates), default=0.0)
-        if _chosen is None or best_true_net <= 0 or best_net_profit <= 0:
+        if _chosen is None or best_profit_score <= 0 or best_net_profit <= 0:
             wait_duration = min(60, max(1, remaining_min))
             decision = {"action": "wait", "params": {"duration_minutes": wait_duration}}
             self._logger.info(
-                "heuristic wait driver=%s best_true_net=%.1f best_net_profit=%.1f",
+                "profit search wait driver=%s best_score=%.1f best_true_net=%.1f best_net_profit=%.1f",
                 driver_id,
+                best_profit_score,
                 best_true_net,
                 best_net_profit,
             )
@@ -4217,8 +4414,9 @@ class ModelDecisionService:
 
         _cid = _chosen["cargo_id"]
         _chosen_tn = _chosen.get("true_net", _chosen["score"])
+        _chosen_ps = ProfitSearchLayer._candidate_value(_chosen)
         _chosen_profit = float(_chosen.get("net_profit", 0.0))
-        if _chosen.get("hard_penalty", 0) == 0 and _chosen_tn > 0 and _chosen_profit > 0:
+        if _chosen.get("hard_penalty", 0) == 0 and _chosen_ps > 0 and _chosen_profit > 0:
             decision = self._validated_take_order_decision(
                 _chosen, items, status_after_query, constraints, state
             )
@@ -4226,10 +4424,12 @@ class ModelDecisionService:
                 state, candidates, decision, current_min
             ):
                 self._logger.info(
-                    "heuristic fast take_order driver=%s cargo=%s true_net=%.1f",
+                    "profit search fast take_order driver=%s cargo=%s score=%.1f true_net=%.1f downstream=%.1f",
                     driver_id,
                     _cid,
+                    _chosen_ps,
                     _chosen_tn,
+                    float(_chosen.get("downstream_value", 0.0)),
                 )
                 self._update_state_after_decision(state, decision, current_min, candidates)
                 self.coordination_layer.record_decision(
@@ -4242,8 +4442,9 @@ class ModelDecisionService:
         if _chosen is not None:
             _cid = _chosen["cargo_id"]
             _chosen_tn = _chosen.get("true_net", _chosen["score"])
-            # 仅 true_net > 0 且无硬罚分时快速接单
-            if _chosen.get("hard_penalty", 0) == 0 and _chosen_tn > 0:
+            _chosen_ps = ProfitSearchLayer._candidate_value(_chosen)
+            # 仅利润搜索分数 > 0 且无硬罚分时快速接单
+            if _chosen.get("hard_penalty", 0) == 0 and _chosen_ps > 0:
                 if state.is_token_budget_exceeded():
                     decision = {"action": "take_order", "params": {"cargo_id": _cid}}
                     if not self._validate_take_order_feasibility(_cid, items, status_after_query):
@@ -4267,10 +4468,10 @@ class ModelDecisionService:
 
         # 10. Token 预算降级：超阈值时不调 LLM
         if state.is_token_budget_exceeded():
-            _chosen = self._select_best_by_true_net(candidates)
+            _chosen = self.profit_search_layer.select_best(candidates)
             if (
                 _chosen
-                and _chosen.get("true_net", _chosen["score"]) > 0
+                and ProfitSearchLayer._candidate_value(_chosen) > 0
                 and float(_chosen.get("net_profit", 0.0)) > 0
                 and _chosen.get("hard_penalty", 0) == 0
             ):
@@ -4298,10 +4499,10 @@ class ModelDecisionService:
 
         # 10.5 Token预算智能分配检查（Task #6）
         if not self.token_optimizer.should_use_llm(driver_id, _decision_complexity, _remaining_steps):
-            _chosen = self._select_best_by_true_net(candidates)
+            _chosen = self.profit_search_layer.select_best(candidates)
             if (
                 _chosen
-                and _chosen.get("true_net", _chosen["score"]) > 0
+                and ProfitSearchLayer._candidate_value(_chosen) > 0
                 and float(_chosen.get("net_profit", 0.0)) > 0
                 and _chosen.get("hard_penalty", 0) == 0
             ):
@@ -4519,11 +4720,18 @@ class ModelDecisionService:
 
                 # 阶段1: pickup 之前 → 移动到 pickup 点
                 if pickup_min > 0 and current_min < pickup_min:
-                    if pickup_dist > 1.0:
+                    travel_to_pickup = _distance_to_minutes(pickup_dist)
+                    prep_buffer = max(15, min(60, pickup_wait + 5))
+                    if (
+                        pickup_dist > 1.0
+                        and current_min + travel_to_pickup + prep_buffer >= pickup_min
+                    ):
                         return {"action": "reposition",
                                 "params": {"latitude": pickup_lat, "longitude": pickup_lng}}
-                    return {"action": "wait",
-                            "params": {"duration_minutes": max(1, min(60, pickup_min - current_min))}}
+                    if pickup_dist <= 1.0 and pickup_min - current_min <= prep_buffer:
+                        return {"action": "wait",
+                                "params": {"duration_minutes": max(1, min(60, pickup_min - current_min))}}
+                    continue
 
                 # 阶段2: pickup ~ home_deadline → 先完成 pickup 等待，再移动到 home
                 if home_deadline > 0 and current_min < home_deadline and not task.get("pickup_wait_done"):
