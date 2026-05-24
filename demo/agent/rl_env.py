@@ -4,10 +4,10 @@ Gymnasium 强化学习训练环境：将物流仿真封装为标准 RL 接口。
 功能说明：
 - LogisticsDriverEnv: 单司机 Gymnasium 环境，每个 episode = 一个完整月度仿真（31天/43200分钟）
 - MultiDriverEnv: 10个司机的并行环境包装，供批量训练使用
-- encode_state: 49维状态向量编码（独立函数，兼容外部调用）
+- encode_state: 79维状态向量编码（独立函数，兼容外部调用）
 
-状态空间: 49维浮点向量（时空5 + 累计6 + 约束8 + Top5货源30）
-动作空间: 9个离散动作（wait_30, wait_60, cargo_0~4, reposition_home, reposition_hotzone）
+状态空间: 79维浮点向量（时空5 + 累计6 + 约束8 + Top10货源60）
+动作空间: 18个离散动作（wait_15/30/60, cargo_0~9, reposition*, force_rest）
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from agent.action_masking import ActionMaskSpec, apply_revenue_risk_mask
+
 try:
     from agent.rl_optimizations import compute_reward_shaping
 except Exception:
@@ -29,21 +31,44 @@ except Exception:
 # 常量（对外暴露，保持向后兼容）
 # ─────────────────────────────────────────────────────────
 
-_STATE_DIM = 49
-_ACTION_DIM = 9
-_TOP_K = 5
+_STATE_DIM = 79
+_ACTION_DIM = 18
+_TOP_K = 10
 _SIM_DURATION_MIN = 43200  # 30天 = 43200分钟（评测标准）
 
 # 动作定义
-ACTION_WAIT_30 = 0
-ACTION_WAIT_60 = 1
-ACTION_CARGO_0 = 2
-ACTION_CARGO_1 = 3
-ACTION_CARGO_2 = 4
-ACTION_CARGO_3 = 5
-ACTION_CARGO_4 = 6
-ACTION_REPOSITION_HOME = 7
-ACTION_REPOSITION_HOTZONE = 8
+ACTION_WAIT_15 = 0
+ACTION_WAIT_30 = 1
+ACTION_WAIT_60 = 2
+ACTION_CARGO_0 = 3
+ACTION_CARGO_1 = 4
+ACTION_CARGO_2 = 5
+ACTION_CARGO_3 = 6
+ACTION_CARGO_4 = 7
+ACTION_CARGO_5 = 8
+ACTION_CARGO_6 = 9
+ACTION_CARGO_7 = 10
+ACTION_CARGO_8 = 11
+ACTION_CARGO_9 = 12
+ACTION_REPOSITION_HOME = 13
+ACTION_REPOSITION_HOTZONE = 14
+ACTION_REPOSITION_SUPPLY_ZONE = 15
+ACTION_REPOSITION_HIGH_VALUE_DEST = 16
+ACTION_FORCE_REST = 17
+
+_WAIT_ACTION_DURATIONS = {
+    ACTION_WAIT_15: 15,
+    ACTION_WAIT_30: 30,
+    ACTION_WAIT_60: 60,
+}
+
+
+def _is_cargo_action(action: int) -> bool:
+    return ACTION_CARGO_0 <= int(action) <= ACTION_CARGO_9
+
+
+def _cargo_index_for_action(action: int) -> int:
+    return int(action) - ACTION_CARGO_0
 
 
 # ─────────────────────────────────────────────────────────
@@ -87,7 +112,7 @@ def encode_state(
     candidates: list[dict[str, Any]],
     constraints: list[dict[str, Any]],
 ) -> np.ndarray:
-    """将原始状态编码为归一化的 49 维 float 向量。
+    """将原始状态编码为归一化的 79 维 float 向量。
 
     兼容接口：供 rl_integration.py 等外部模块调用。
     state_tracker 可以是带属性的对象，也可以是 dict。
@@ -202,7 +227,7 @@ def encode_state(
     vec[17] = mandatory_pending / 5.0
     vec[18] = scheduled_pending / 3.0
 
-    # ── Top-5 候选货源特征 (6维 x 5 = 30维) [19..48] ──
+    # ── Top-10 候选货源特征 (6维 x 10 = 60维) [19..78] ──
     cost_per_km = 1.5
     for i in range(_TOP_K):
         offset = 19 + i * 6
@@ -373,12 +398,12 @@ class LogisticsDriverEnv(gym.Env):
         self._max_steps = max_steps
         self._step_count = 0
 
-        # 状态空间：49维浮点向量
+        # 状态空间：79维浮点向量
         self.observation_space = spaces.Box(
             low=-1.0, high=10.0, shape=(_STATE_DIM,), dtype=np.float32
         )
 
-        # 动作空间：9个离散动作
+        # 动作空间：18个离散动作
         self.action_space = spaces.Discrete(_ACTION_DIM)
 
         # 内部状态
@@ -406,6 +431,8 @@ class LogisticsDriverEnv(gym.Env):
         self.monthly_planner = None
         self.completed_idle_days = 0
         self.cargo_frequency: dict[int, int] = {}
+        self._last_action_mask_reasons: dict[int, str] = {}
+        self._last_reward_breakdown: dict[str, float] = {}
 
     def reset(self, seed=None, options=None):
         """重置环境，从仿真服务获取初始状态。"""
@@ -430,6 +457,8 @@ class LogisticsDriverEnv(gym.Env):
         self.completed_tasks = []
         self.completed_idle_days = 0
         self.cargo_frequency = {}
+        self._last_action_mask_reasons = {}
+        self._last_reward_breakdown = {}
 
         # 如果是 mock 模式，重置进度
         if isinstance(self.api, _MockSimulationApi):
@@ -503,13 +532,37 @@ class LogisticsDriverEnv(gym.Env):
 
     def get_action_mask(self) -> np.ndarray:
         mask = np.zeros(_ACTION_DIM, dtype=np.bool_)
+        mask[ACTION_WAIT_15] = True
         mask[ACTION_WAIT_30] = True
         mask[ACTION_WAIT_60] = True
         for idx in range(min(len(self._current_cargo_list), _TOP_K)):
             mask[ACTION_CARGO_0 + idx] = True
         mask[ACTION_REPOSITION_HOME] = bool(self.driver_config.get("home"))
         mask[ACTION_REPOSITION_HOTZONE] = self._get_hotzone() is not None
+        mask[ACTION_REPOSITION_SUPPLY_ZONE] = self._get_supply_zone() is not None
+        mask[ACTION_REPOSITION_HIGH_VALUE_DEST] = self._get_high_value_destination() is not None
+        mask[ACTION_FORCE_REST] = self._rest_today_min < self.driver_config.get("required_rest_min", 240)
+        mask, reasons = apply_revenue_risk_mask(
+            mask,
+            cargo_list=self._current_cargo_list,
+            spec=ActionMaskSpec(
+                action_dim=_ACTION_DIM,
+                cargo_start=ACTION_CARGO_0,
+                top_k=_TOP_K,
+                wait_actions=tuple(_WAIT_ACTION_DURATIONS),
+                force_rest_action=ACTION_FORCE_REST,
+            ),
+            driver_config=self.driver_config,
+            total_deadhead_km=self._total_deadhead,
+            rest_today_min=self._rest_today_min,
+            consecutive_wait_min=self._consecutive_wait_minutes.get(self.driver_id, 0.0),
+        )
+        self._last_action_mask_reasons = reasons
         return mask
+
+    def action_masks(self) -> np.ndarray:
+        """MaskablePPO-compatible action mask. True means the action is valid."""
+        return self.get_action_mask()
 
     def _record_wait(self, duration_minutes: int) -> None:
         self._consecutive_wait_minutes[self.driver_id] = (
@@ -529,11 +582,29 @@ class LogisticsDriverEnv(gym.Env):
             return 0.0
         return float(action_result.get("revenue", 0.0) or 0.0)
 
+    def _has_positive_cargo_available(self, cargo_list: list[dict[str, Any]]) -> bool:
+        for item in cargo_list:
+            true_net = item.get("true_net", item.get("score"))
+            if true_net is None:
+                cargo = item.get("cargo", {})
+                price = float(cargo.get("price", item.get("price", 0.0)) or 0.0)
+                deadhead_km = float(item.get("distance_km", item.get("deadhead_km", 0.0)) or 0.0)
+                haul_km = float(item.get("haul_km", 0.0) or _compute_haul_km(cargo))
+                true_net = price - (deadhead_km + haul_km) * self.cost_per_km
+            net_profit = item.get("net_profit", true_net)
+            if float(true_net or 0.0) > 0 and float(net_profit or 0.0) > 0:
+                return True
+        return False
+
     def step(self, action: int):
         """执行动作，返回 (obs, reward, terminated, truncated, info)。"""
+        action = int(action)
         self._step_count += 1
         prev_status = self._current_status
         action_result: dict[str, Any] = {}
+        pre_positive_cargo_available = self._has_positive_cargo_available(
+            self._current_cargo_list
+        )
 
         # 检测日期切换，重置每日计数器
         curr_progress = prev_status.get("simulation_progress_minutes", 0)
@@ -545,22 +616,20 @@ class LogisticsDriverEnv(gym.Env):
             self._last_day = curr_day
 
         # ──── 执行动作 ────
-        if action == ACTION_WAIT_30:
-            self.api.wait(self.driver_id, 30)
-            self._record_wait(30)
+        if action in _WAIT_ACTION_DURATIONS:
+            duration = _WAIT_ACTION_DURATIONS[action]
+            self.api.wait(self.driver_id, duration)
+            self._record_wait(duration)
 
-        elif action == ACTION_WAIT_60:
-            self.api.wait(self.driver_id, 60)
-            self._record_wait(60)
-
-        elif 2 <= action <= 6:
-            cargo_idx = action - 2
+        elif _is_cargo_action(action):
+            cargo_idx = _cargo_index_for_action(action)
             self._consecutive_wait_minutes[self.driver_id] = 0
             self._last_rest_duration = 0.0
             if cargo_idx < len(self._current_cargo_list):
                 cargo_item = self._current_cargo_list[cargo_idx]
                 cargo_id = str(cargo_item["cargo"]["cargo_id"])
                 action_result = self.api.take_order(self.driver_id, cargo_id)
+                action_result["_cargo_item"] = cargo_item
                 if action_result.get("accepted"):
                     revenue = self._effective_revenue(action_result)
                     self._total_income += revenue
@@ -612,12 +681,44 @@ class LogisticsDriverEnv(gym.Env):
                 self.api.wait(self.driver_id, 30)
                 self._record_wait(30)
 
+        elif action == ACTION_REPOSITION_SUPPLY_ZONE:
+            supply_zone = self._get_supply_zone()
+            if supply_zone:
+                self.api.reposition(self.driver_id, supply_zone[0], supply_zone[1])
+                self._consecutive_wait_minutes[self.driver_id] = 0
+                self._last_rest_duration = 0.0
+            else:
+                self.api.wait(self.driver_id, 30)
+                self._record_wait(30)
+
+        elif action == ACTION_REPOSITION_HIGH_VALUE_DEST:
+            target = self._get_high_value_destination()
+            if target:
+                self.api.reposition(self.driver_id, target[0], target[1])
+                self._consecutive_wait_minutes[self.driver_id] = 0
+                self._last_rest_duration = 0.0
+            else:
+                self.api.wait(self.driver_id, 30)
+                self._record_wait(30)
+
+        elif action == ACTION_FORCE_REST:
+            required_rest = int(self.driver_config.get("required_rest_min", 240))
+            remaining = max(0, required_rest - int(self._rest_today_min))
+            duration = min(240, max(30, remaining or 30))
+            self.api.wait(self.driver_id, duration)
+            self._record_wait(duration)
+
+        else:
+            self.api.wait(self.driver_id, 30)
+            self._record_wait(30)
+
         # ──── 获取新状态 ────
         curr_status = self.api.get_driver_status(self.driver_id)
         self._current_status = curr_status
 
         # 查询新货源
         self._current_cargo_list = self._refresh_candidates(curr_status)
+        action_result["_pre_positive_cargo_available"] = pre_positive_cargo_available
 
         # 计算 reward
         reward = self._compute_reward(
@@ -634,6 +735,8 @@ class LogisticsDriverEnv(gym.Env):
         if terminated or truncated:
             terminal_reward = net_income / 1000.0
             reward += terminal_reward
+        self._last_reward_breakdown["terminal_monthly_net_income"] = terminal_reward
+        self._last_reward_breakdown["total"] = reward
 
         obs = self._encode_state(curr_status, self._current_cargo_list)
         info = {
@@ -647,6 +750,8 @@ class LogisticsDriverEnv(gym.Env):
             "orders_today": self._orders_today,
             "total_orders": self._total_orders,
             "action_mask": self.get_action_mask(),
+            "action_mask_reasons": dict(self._last_action_mask_reasons),
+            "reward_breakdown": dict(self._last_reward_breakdown),
         }
 
         return obs, reward, terminated, truncated, info
@@ -693,7 +798,7 @@ class LogisticsDriverEnv(gym.Env):
     def _encode_state(
         self, status: dict[str, Any], cargo_list: list[dict[str, Any]]
     ) -> np.ndarray:
-        """将当前状态编码为 49 维归一化向量。"""
+        """将当前状态编码为 79 维归一化向量。"""
         vec = np.zeros(_STATE_DIM, dtype=np.float32)
         sim_min = int(status.get("simulation_progress_minutes", 0))
 
@@ -754,7 +859,7 @@ class LogisticsDriverEnv(gym.Env):
         vec[17] = self.driver_config.get("mandatory_cargo_pending", 0) / 5.0
         vec[18] = self.driver_config.get("scheduled_event_pending", 0) / 3.0
 
-        # ── Top-5 候选货源特征 (6维 x 5 = 30维) [19..48] ──
+        # ── Top-10 候选货源特征 (6维 x 10 = 60维) [19..78] ──
         for i in range(_TOP_K):
             offset = 19 + i * 6
             if i < len(cargo_list):
@@ -794,64 +899,113 @@ class LogisticsDriverEnv(gym.Env):
         curr_status: dict[str, Any],
         driver_id: str,
     ) -> float:
-        """计算即时奖励。"""
-        reward = 0.0
+        """计算收入导向即时奖励，并记录 reward breakdown。"""
+        breakdown: dict[str, float] = {
+            "actual_net_income": 0.0,
+            "time_efficiency_bonus": 0.0,
+            "destination_future_value_bonus": 0.0,
+            "deadhead_budget_penalty": 0.0,
+            "penalty_risk_penalty": 0.0,
+            "bad_wait_penalty": 0.0,
+            "low_activity_bonus": 0.0,
+            "low_activity_wait_penalty": 0.0,
+            "opportunity_wait_penalty": 0.0,
+            "force_rest_overuse_penalty": 0.0,
+            "rest_completion_bonus": 0.0,
+            "legacy_reward_shaping": 0.0,
+            "urgency_multiplier": 1.0,
+        }
 
-        # 1. 即时净收益（核心奖励）
-        if 2 <= action <= 6 and action_result.get("accepted"):
-            revenue = self._effective_revenue(action_result)
-            deadhead_km = action_result.get("pickup_deadhead_km", 0)
-            haul_km = action_result.get("haul_distance_km", 0)
-            cost = (deadhead_km + haul_km) * self.cost_per_km
-            reward += (revenue - cost) / 1000.0
-
-        # 2. 新增罚分惩罚
-        new_penalty = curr_status.get("new_penalty", 0)
-        reward -= new_penalty / 500.0
-        self._total_penalty += new_penalty
-
-        # 3. 时间效率奖励（惩罚无效等待）
         time_elapsed = (
             curr_status["simulation_progress_minutes"]
             - prev_status["simulation_progress_minutes"]
         )
-        if action in (ACTION_WAIT_30, ACTION_WAIT_60) and time_elapsed > 0:
-            reward -= 0.05 * (time_elapsed / 60.0)
+
+        # 1. 即时净收益（核心奖励）
+        if _is_cargo_action(action) and action_result.get("accepted"):
+            revenue = self._effective_revenue(action_result)
+            deadhead_km = float(action_result.get("pickup_deadhead_km", 0.0) or 0.0)
+            haul_km = float(action_result.get("haul_distance_km", 0.0) or 0.0)
+            cost = (deadhead_km + haul_km) * self.cost_per_km
+            net = revenue - cost
+            breakdown["actual_net_income"] = net / 1000.0
+
+            elapsed_hours = max(0.25, float(time_elapsed or 0) / 60.0)
+            net_per_hour = net / elapsed_hours
+            if net_per_hour > 120.0:
+                breakdown["time_efficiency_bonus"] = min(0.6, (net_per_hour - 120.0) / 2000.0)
+            elif net_per_hour < 40.0:
+                breakdown["time_efficiency_bonus"] = max(-0.4, (net_per_hour - 40.0) / 1000.0)
+
+            cargo_item = action_result.get("_cargo_item", {})
+            end = cargo_item.get("cargo", {}).get("end", {})
+            end_lat = end.get("lat")
+            end_lng = end.get("lng")
+            if end_lat is not None and end_lng is not None:
+                future_value = self._get_spatial_value(float(end_lat), float(end_lng))
+                breakdown["destination_future_value_bonus"] = max(
+                    -0.2,
+                    min(0.5, future_value / 10000.0),
+                )
+
+            max_deadhead = float(self.driver_config.get("max_deadhead_km", 0.0) or 0.0)
+            if max_deadhead > 0:
+                over_budget = max(0.0, self._total_deadhead - max_deadhead)
+                budget_ratio = self._total_deadhead / max_deadhead
+                if over_budget > 0:
+                    breakdown["deadhead_budget_penalty"] = -min(1.0, over_budget / 500.0)
+                elif budget_ratio > 0.85:
+                    breakdown["deadhead_budget_penalty"] = -0.2 * (budget_ratio - 0.85) / 0.15
+
+        # 2. 新增罚分惩罚
+        new_penalty = float(curr_status.get("new_penalty", 0.0) or 0.0)
+        breakdown["penalty_risk_penalty"] = -new_penalty / 500.0
+        self._total_penalty += new_penalty
+
+        # 3. 时间效率奖励（惩罚无效等待）
+        is_wait_like = action in _WAIT_ACTION_DURATIONS or action == ACTION_FORCE_REST
+        if is_wait_like and time_elapsed > 0:
+            waited_hours = time_elapsed / 60.0
+            breakdown["bad_wait_penalty"] = -0.05 * waited_hours
+            if action_result.get("_pre_positive_cargo_available"):
+                breakdown["opportunity_wait_penalty"] = -0.4 * waited_hours
+                if action == ACTION_FORCE_REST:
+                    breakdown["force_rest_overuse_penalty"] = -0.6
 
         # 4. 针对低活跃司机的激进探索奖励
         if driver_id in ("D002", "D006", "D007"):
-            if 2 <= action <= 6 and action_result.get("accepted"):
-                reward += 0.5
-            if action in (ACTION_WAIT_30, ACTION_WAIT_60):
+            if _is_cargo_action(action) and action_result.get("accepted"):
+                breakdown["low_activity_bonus"] = 0.5
+            if action in _WAIT_ACTION_DURATIONS:
                 consecutive_wait_h = (
                     self._consecutive_wait_minutes.get(driver_id, 0) / 60.0
                 )
                 if consecutive_wait_h > 2.0:
-                    reward -= 0.1 * (consecutive_wait_h - 2.0)
+                    breakdown["low_activity_wait_penalty"] = -0.1 * (consecutive_wait_h - 2.0)
 
         # 5. 月末紧迫度加权
         day = curr_status["simulation_progress_minutes"] // 1440
         urgency = 1.0 + 0.3 * (day / 30.0)
-        reward *= urgency
+        breakdown["urgency_multiplier"] = urgency
 
         # 6. 休息完成奖励（D008重点）
-        if action in (ACTION_WAIT_30, ACTION_WAIT_60):
+        if action in _WAIT_ACTION_DURATIONS or action == ACTION_FORCE_REST:
             if self._just_completed_rest_requirement(driver_id, curr_status):
-                reward += 0.3
+                breakdown["rest_completion_bonus"] = 0.3
 
         if compute_reward_shaping is not None:
             action_name = "other"
             duration = 0
-            if action == ACTION_WAIT_30:
+            if action in _WAIT_ACTION_DURATIONS:
                 action_name = "wait"
-                duration = 30
-            elif action == ACTION_WAIT_60:
+                duration = _WAIT_ACTION_DURATIONS[action]
+            elif action == ACTION_FORCE_REST:
                 action_name = "wait"
-                duration = 60
-            elif 2 <= action <= 6 and action_result.get("accepted"):
+                duration = int(self._last_rest_duration)
+            elif _is_cargo_action(action) and action_result.get("accepted"):
                 action_name = "take_order"
 
-            reward += compute_reward_shaping(
+            breakdown["legacy_reward_shaping"] = compute_reward_shaping(
                 driver_id=driver_id,
                 state_tracker=self,
                 sim_min=int(curr_status["simulation_progress_minutes"]),
@@ -863,6 +1017,14 @@ class LogisticsDriverEnv(gym.Env):
                 ),
             ) / 1000.0
 
+        pre_urgency = sum(
+            value for key, value in breakdown.items()
+            if key != "urgency_multiplier"
+        )
+        reward = pre_urgency * urgency
+        self._last_reward_breakdown = dict(breakdown)
+        self._last_reward_breakdown["pre_urgency_total"] = pre_urgency
+        self._last_reward_breakdown["immediate_total"] = reward
         return reward
 
     def get_max_continuous_rest_today(self, sim_min: int) -> float:
@@ -891,6 +1053,42 @@ class LogisticsDriverEnv(gym.Env):
             except ValueError:
                 return None
         return None
+
+    def _get_supply_zone(self) -> tuple[float, float] | None:
+        """Return the pickup area of the strongest currently visible cargo."""
+        if not self._current_cargo_list:
+            return None
+        best = max(self._current_cargo_list, key=self._candidate_estimated_value)
+        start = best.get("cargo", {}).get("start", {})
+        lat = start.get("lat")
+        lng = start.get("lng")
+        if lat is None or lng is None:
+            return None
+        return float(lat), float(lng)
+
+    def _get_high_value_destination(self) -> tuple[float, float] | None:
+        """Return the destination of the highest-value currently visible cargo."""
+        if not self._current_cargo_list:
+            return self._get_hotzone()
+        best = max(self._current_cargo_list, key=self._candidate_estimated_value)
+        end = best.get("cargo", {}).get("end", {})
+        lat = end.get("lat")
+        lng = end.get("lng")
+        if lat is None or lng is None:
+            return self._get_hotzone()
+        return float(lat), float(lng)
+
+    def _candidate_estimated_value(self, item: dict[str, Any]) -> float:
+        score = item.get("profit_search_score")
+        if score is None:
+            score = item.get("true_net", item.get("score"))
+        if score is not None:
+            return float(score or 0.0)
+        cargo = item.get("cargo", {})
+        price = float(cargo.get("price", 0.0) or 0.0)
+        deadhead_km = float(item.get("distance_km", 0.0) or 0.0)
+        haul_km = float(item.get("haul_km", 0.0) or _compute_haul_km(cargo))
+        return price - (deadhead_km + haul_km) * self.cost_per_km
 
     def _just_completed_rest_requirement(
         self, driver_id: str, status: dict[str, Any]

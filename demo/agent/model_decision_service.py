@@ -104,6 +104,30 @@ def _get_horizon_minutes(status: dict) -> int:
         return _MONTH_TOTAL_MINUTES
 
 
+def _get_reposition_target(action: str, status: dict) -> tuple[float | None, float | None]:
+    """Extract target coordinates for a reposition action from status dict.
+
+    Returns (lat, lng) or (None, None) if the target cannot be determined.
+    """
+    # reposition_home: try home_base in status, fall back to current position
+    if action == "reposition_home":
+        home = status.get("home_base")
+        if isinstance(home, dict):
+            lat, lng = home.get("lat"), home.get("lng")
+            if lat is not None and lng is not None:
+                return float(lat), float(lng)
+        # No explicit home in status; use current position (no-op reposition)
+        lat = status.get("current_lat")
+        lng = status.get("current_lng")
+        if lat is not None and lng is not None:
+            return float(lat), float(lng)
+        return None, None
+
+    # Other reposition targets require cargo/grid data not in the status dict;
+    # return None so the caller falls back to wait.
+    return None, None
+
+
 def _iter_days_touched(start_min: int, end_min: int) -> range:
     """返回 [start, end) 覆盖的自然日索引。"""
     if end_min <= start_min:
@@ -3469,6 +3493,7 @@ class ModelDecisionService:
         self.coordination_layer = MultiDriverCoordinationLayer()
         # RL 增强层（可选加载）
         self._rl_layer = self._try_load_rl_layer() if enable_rl_layer else None
+        self._maskable_rl_layer = self._try_load_maskable_rl_layer() if enable_rl_layer else None
         # 已注册到 token_optimizer / coordination_layer 的 driver 集合
         self._registered_drivers: set[str] = set()
         # Task #4: 战略规划器 + 决策审核员
@@ -3501,6 +3526,52 @@ class ModelDecisionService:
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def _try_load_maskable_rl_layer() -> Any:
+        """尝试加载 MaskablePPO 决策层（优先于自定义 PPO RL 层）。"""
+        try:
+            from agent.maskable_rl_integration import MaskableRLDecisionLayer
+            from pathlib import Path
+            model_dir = Path(__file__).parent / "models"
+            layer = MaskableRLDecisionLayer(model_dir=model_dir)
+            if layer.is_loaded:
+                return layer
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _translate_maskable_action(result: dict, status: dict, driver_id: str) -> dict:
+        """Translate MaskableRLDecisionLayer action names to orchestrator format.
+
+        Orchestrator expects: wait, reposition, take_order.
+        Maskable layer produces: wait, cargo, force_rest, reposition_home/hotzone/supply_zone/high_value_dest.
+        """
+        action = result.get("action", "wait")
+        params = result.get("params", {})
+
+        if action == "cargo":
+            candidate = params.get("candidate", {})
+            cargo_id = candidate.get("cargo_id", candidate.get("cargo", {}).get("cargo_id", ""))
+            return {"action": "take_order", "params": {"cargo_id": str(cargo_id)}}
+
+        if action == "force_rest":
+            # Force rest is a wait action; compute duration from rest deficit
+            rest_needed = max(30, int(params.get("rest_minutes", 60)))
+            return {"action": "wait", "params": {"duration_minutes": min(rest_needed, 240)}}
+
+        if action.startswith("reposition_"):
+            # Extract target coordinates from status/state
+            lat, lng = _get_reposition_target(action, status)
+            if lat is not None and lng is not None:
+                return {"action": "reposition", "params": {"latitude": lat, "longitude": lng}}
+            # Fallback to wait if no target found
+            return {"action": "wait", "params": {"duration_minutes": 30}}
+
+        # wait and anything else
+        duration = int(params.get("duration_minutes", 30))
+        return {"action": "wait", "params": {"duration_minutes": duration}}
 
     @staticmethod
     def _task_key(task: dict) -> tuple:
@@ -4443,7 +4514,40 @@ class ModelDecisionService:
         # 同步 StateTracker 的 token 用量到 token_optimizer
         self.token_optimizer.usage_tracker[driver_id] = state.total_tokens_used
 
-        if self._rl_layer is not None:
+        # MaskablePPO 主决策路径（优先于自定义 PPO 路径）
+        if self._maskable_rl_layer is not None and self._maskable_rl_layer.is_loaded:
+            _maskable_result = self._maskable_rl_layer.decide(
+                candidates, status_after_query, state, constraints,
+            )
+            if (
+                _maskable_result is not None
+                and not _maskable_result.get("fallback_used", True)
+                and not self._has_safe_profit_candidate(candidates)
+            ):
+                decision = self._translate_maskable_action(
+                    _maskable_result, status_after_query, driver_id,
+                )
+                self._logger.info(
+                    "MaskablePPO decision driver=%s action=%s prob=%.3f model=%s",
+                    driver_id,
+                    _maskable_result["action"],
+                    float(_maskable_result.get("rl_prob", 0.0)),
+                    _maskable_result.get("model_type", "?"),
+                )
+                decision = self._maybe_review_decision(
+                    decision, candidates, state, status_after_query,
+                    constraints, current_min, driver_id,
+                    _decision_complexity, _remaining_steps, items,
+                )
+                self._update_state_after_decision(state, decision, current_min, candidates)
+                self.coordination_layer.record_decision(
+                    driver_id,
+                    "",
+                    decision.get("action", ""),
+                )
+                return decision
+
+        if self._rl_layer is not None and not self._has_safe_profit_candidate(candidates):
             _rl_wait = self._rl_layer.select_wait_action(
                 candidates, status_after_query, state, constraints
             )
@@ -4488,6 +4592,36 @@ class ModelDecisionService:
         )
         best_net_profit = max((float(c.get("net_profit", 0.0)) for c in candidates), default=0.0)
         if _chosen is None or best_profit_score <= 0 or best_net_profit <= 0:
+            _true_net_chosen = self._select_best_by_true_net(candidates)
+            if (
+                _true_net_chosen is not None
+                and self._is_positive_net_candidate(_true_net_chosen)
+            ):
+                decision = self._validated_take_order_decision(
+                    _true_net_chosen, items, status_after_query, constraints, state
+                )
+                if decision is not None:
+                    decision = self._maybe_review_decision(
+                        decision, candidates, state, status_after_query,
+                        constraints, current_min, driver_id,
+                        _decision_complexity, _remaining_steps, items,
+                    )
+                    self._logger.info(
+                        "true_net fallback take_order driver=%s cargo=%s true_net=%.1f score=%.1f net_profit=%.1f",
+                        driver_id,
+                        _true_net_chosen.get("cargo_id", ""),
+                        self._candidate_true_net(_true_net_chosen),
+                        ProfitSearchLayer._candidate_value(_true_net_chosen),
+                        float(_true_net_chosen.get("net_profit", 0.0) or 0.0),
+                    )
+                    self._update_state_after_decision(state, decision, current_min, candidates)
+                    self.coordination_layer.record_decision(
+                        driver_id,
+                        decision.get("params", {}).get("cargo_id", ""),
+                        decision.get("action", ""),
+                    )
+                    return decision
+
             wait_duration = min(60, max(1, remaining_min))
             decision = {"action": "wait", "params": {"duration_minutes": wait_duration}}
             self._logger.info(
@@ -5204,6 +5338,30 @@ class ModelDecisionService:
         except Exception as e:
             self._logger.warning("DecisionReviewer 异常 driver=%s: %s", driver_id, e)
         return decision
+
+    @staticmethod
+    def _candidate_true_net(candidate: dict) -> float:
+        return float(candidate.get("true_net", candidate.get("score", 0.0)) or 0.0)
+
+    @classmethod
+    def _is_positive_net_candidate(cls, candidate: dict) -> bool:
+        if candidate.get("hard_penalty", 0):
+            return False
+        if not ProfitSearchLayer._passes_guard(candidate):
+            return False
+        if cls._candidate_true_net(candidate) <= 0:
+            return False
+        if float(candidate.get("net_profit", 0.0) or 0.0) <= 0:
+            return False
+        return True
+
+    @classmethod
+    def _has_safe_profit_candidate(cls, candidates: list[dict]) -> bool:
+        """Return True when there is a viable positive-net order."""
+        for candidate in candidates:
+            if cls._is_positive_net_candidate(candidate):
+                return True
+        return False
 
     def _update_state_after_decision(self, state: StateTracker, decision: dict,
                                      current_min: int, candidates: list[dict] | None = None) -> None:

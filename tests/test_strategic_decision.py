@@ -1868,6 +1868,43 @@ class TestShortRunFastDecision:
         assert decision == {"action": "take_order", "params": {"cargo_id": "C_FAST"}}
         assert api.model_calls == 0
 
+    def test_maskable_force_rest_does_not_override_positive_true_net(self):
+        class ForceRestLayer:
+            is_loaded = True
+
+            def decide(self, candidates, status, state, constraints):
+                return {
+                    "action": "force_rest",
+                    "params": {"rest_minutes": 240},
+                    "fallback_used": False,
+                    "rl_prob": 0.99,
+                    "model_type": "test",
+                }
+
+        api = self.NoModelApi(self._item(price=1000))
+        svc = ModelDecisionService(api)
+        svc._preference_engine.get_constraints = lambda driver_id, prefs: []
+        svc._maskable_rl_layer = ForceRestLayer()
+        svc._rl_layer = None
+        svc._reviewer.should_review = lambda *args, **kwargs: False
+
+        def negative_search_score(candidates, *args, **kwargs):
+            ranked = []
+            for candidate in candidates:
+                item = dict(candidate)
+                item["profit_search_score"] = -45.0
+                item["true_net"] = 80.0
+                item["net_profit"] = 680.0
+                ranked.append(item)
+            return ranked
+
+        svc.profit_search_layer.rank_candidates = negative_search_score
+
+        decision = svc.decide("D_TEST")
+
+        assert decision == {"action": "take_order", "params": {"cargo_id": "C_FAST"}}
+        assert api.model_calls == 0
+
     def test_profit_search_prefers_downstream_hot_area_without_model(self):
         cold = self._item(price=1100, cargo_id="C_COLD", end_lat=23.0, end_lng=113.0)
         hot = self._item(price=980, cargo_id="C_HOT", end_lat=23.1, end_lng=113.1)

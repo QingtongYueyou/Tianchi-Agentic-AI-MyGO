@@ -6,7 +6,7 @@ rl_models.py - 物流调度强化学习系统神经网络模型定义
 
 1. PolicyNetwork (Actor-Critic 共享骨干)
    - 集成位置: rl_integration.py 中的策略决策层
-   - 功能: 输入49维状态向量，输出9维动作logits + 状态价值估计
+   - 功能: 输入79维状态向量，输出18维动作logits + 状态价值估计
    - 用于PPO算法训练，学习最优调度策略
 
 2. PositionValueNetwork (位置价值预测网络)
@@ -44,6 +44,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
+from agent.rl_env import _ACTION_DIM, _STATE_DIM
+
 
 def _get_device() -> torch.device:
     """自动检测可用设备"""
@@ -72,7 +74,7 @@ class PolicyNetwork(nn.Module):
     """
     Actor-Critic 共享骨干策略网络。
     
-    输入: state向量 (49维 float32)
+    输入: state向量 (79维 float32)
     输出:
       - policy_logits: (batch, 9) 动作概率对数
       - value: (batch, 1) 状态价值估计
@@ -86,7 +88,7 @@ class PolicyNetwork(nn.Module):
       value_head:  Linear(128, 1)
     """
 
-    def __init__(self, state_dim: int = 49, action_dim: int = 9, device: Optional[torch.device] = None) -> None:
+    def __init__(self, state_dim: int = _STATE_DIM, action_dim: int = _ACTION_DIM, device: Optional[torch.device] = None) -> None:
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -717,6 +719,21 @@ class PolicyNetworkNumpy:
         try:
             data = np.load(path, allow_pickle=False)
             self._weights = {k: data[k] for k in data.files}
+            state_dim = int(self._weights.get("_state_dim", np.array([_STATE_DIM]))[0])
+            action_dim = int(self._weights.get("_action_dim", np.array([_ACTION_DIM]))[0])
+            if state_dim != _STATE_DIM or action_dim != _ACTION_DIM:
+                import logging
+                logging.getLogger("agent.rl_models").warning(
+                    "PolicyNetworkNumpy ignored incompatible weights from %s: state_dim=%s action_dim=%s expected=(%s,%s)",
+                    path,
+                    state_dim,
+                    action_dim,
+                    _STATE_DIM,
+                    _ACTION_DIM,
+                )
+                self._weights = {}
+                self._loaded = False
+                return
             self._loaded = True
             import logging
             logging.getLogger("agent.rl_models").info("PolicyNetworkNumpy loaded from %s", path)
@@ -764,7 +781,7 @@ class PolicyNetworkNumpy:
         import numpy as np
         if not self._loaded:
             # 未加载时返回均匀分布
-            n_actions = 9
+            n_actions = _ACTION_DIM
             return np.ones(n_actions) / n_actions, 0.0
         
         x = np.array(state, dtype=np.float32).flatten()
@@ -794,7 +811,7 @@ class PolicyNetworkNumpy:
             
             return probs, value
         except Exception:
-            n_actions = int(self._weights.get("_action_dim", np.array([9]))[0])
+            n_actions = int(self._weights.get("_action_dim", np.array([_ACTION_DIM]))[0])
             return np.ones(n_actions) / n_actions, 0.0
     
     def get_action(self, state: "np.ndarray", deterministic: bool = False) -> int:
@@ -933,8 +950,8 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print("=== PolicyNetwork 测试 ===")
-    policy = PolicyNetwork(state_dim=49, action_dim=9)
-    state = torch.randn(1, 49)
+    policy = PolicyNetwork(state_dim=_STATE_DIM, action_dim=_ACTION_DIM)
+    state = torch.randn(1, _STATE_DIM)
     logits, value = policy(state)
     print(f"  logits shape: {logits.shape}")  # (1, 9)
     print(f"  value shape: {value.shape}")    # (1, 1)

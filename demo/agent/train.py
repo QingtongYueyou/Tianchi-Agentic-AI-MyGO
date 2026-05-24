@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
@@ -198,6 +199,88 @@ def build_ppo_config(config: dict[str, Any], phase: int) -> Any:
     )
 
 
+def build_maskable_ppo_config(config: dict[str, Any], phase: int, base_model_path: str | None = None) -> Any:
+    """Map rl_config.yaml into MaskablePPOConfig."""
+    from agent.sb3_maskable_trainer import MaskablePPOConfig
+
+    model_dir = resolve_project_path(get_config_value(
+        config, "model_dir", "paths.models_dir", default="demo/agent/models"
+    ))
+    logs_dir = resolve_project_path(get_config_value(
+        config, "logs_dir", "paths.logs_dir", default="demo/results/rl_logs"
+    ))
+    n_steps = int(get_config_value(config, "n_steps", "ppo.n_steps", default=2048))
+    total_timesteps = get_config_value(
+        config,
+        "total_timesteps",
+        "maskable_ppo.total_timesteps",
+        default=None,
+    )
+    if total_timesteps is None:
+        episodes = int(get_config_value(
+            config, "total_episodes", "training.ppo_episodes", default=1
+        ))
+        if phase == 1 and "total_episodes" not in config:
+            episodes = int(get_config_value(config, "training.bc_episodes", default=1))
+        elif phase == 3 and "total_episodes" not in config:
+            episodes = int(get_config_value(config, "training.finetune_episodes", default=1))
+        total_timesteps = max(1, episodes) * n_steps
+
+    return MaskablePPOConfig(
+        learning_rate=get_config_value(
+            config, "learning_rate", "ppo.learning_rate", default=3e-4
+        ),
+        gamma=get_config_value(config, "gamma", "ppo.gamma", default=0.995),
+        gae_lambda=get_config_value(
+            config, "gae_lambda", "ppo.gae_lambda", default=0.95
+        ),
+        clip_epsilon=get_config_value(
+            config, "clip_epsilon", "ppo.clip_epsilon", default=0.2
+        ),
+        entropy_coef=get_config_value(
+            config, "entropy_coef", "ppo.entropy_coef", default=0.01
+        ),
+        value_coef=get_config_value(
+            config, "value_coef", "ppo.value_coef", default=0.5
+        ),
+        max_grad_norm=get_config_value(
+            config, "max_grad_norm", "ppo.max_grad_norm", default=0.5
+        ),
+        batch_size=int(get_config_value(
+            config, "batch_size", "ppo.batch_size", default=256
+        )),
+        n_epochs=int(get_config_value(config, "n_epochs", "ppo.n_epochs", default=10)),
+        n_steps=n_steps,
+        total_timesteps=int(total_timesteps),
+        eval_interval=int(get_config_value(
+            config, "eval_interval", "training.eval_interval", default=50
+        )),
+        save_interval=int(get_config_value(
+            config, "save_interval", "training.save_interval", default=100
+        )),
+        model_dir=model_dir,
+        logs_dir=logs_dir,
+        seed=get_config_value(config, "seed", "maskable_ppo.seed", default=None),
+        verbose=int(get_config_value(config, "verbose", "maskable_ppo.verbose", default=1)),
+        teacher_pretrain_steps=int(get_config_value(
+            config, "teacher_pretrain_steps", "maskable_ppo.teacher_pretrain_steps", default=0
+        )),
+        teacher_pretrain_epochs=int(get_config_value(
+            config, "teacher_pretrain_epochs", "maskable_ppo.teacher_pretrain_epochs", default=0
+        )),
+        teacher_batch_size=int(get_config_value(
+            config, "teacher_batch_size", "maskable_ppo.teacher_batch_size", default=64
+        )),
+        teacher_learning_rate=float(get_config_value(
+            config, "teacher_learning_rate", "maskable_ppo.teacher_learning_rate", default=1e-4
+        )),
+        teacher_min_cargo_score=float(get_config_value(
+            config, "teacher_min_cargo_score", "maskable_ppo.teacher_min_cargo_score", default=0.0
+        )),
+        base_model_path=base_model_path,
+    )
+
+
 def _extract_driver_config(
     profile: dict[str, Any],
     status: dict[str, Any],
@@ -246,6 +329,8 @@ def _deterministic_constraints(decision_service: Any, driver_id: str, preference
 
 
 def _build_training_candidate_ranker(decision_service: Any):
+    from agent.rl_env import _TOP_K
+
     heuristic = getattr(decision_service, "_heuristic_layer", None)
     profit_search = getattr(decision_service, "profit_search_layer", None)
     time_window = getattr(decision_service, "_time_window_optimizer", None)
@@ -279,15 +364,15 @@ def _build_training_candidate_ranker(decision_service: Any):
                 int(status.get("simulation_horizon_minutes", 43200)),
             )
         if heuristic is None:
-            return ranked_items[:5]
+            return ranked_items[:_TOP_K]
         candidates = heuristic.score_and_rank(
-            ranked_items, status, state, constraints, top_n=12
+            ranked_items, status, state, constraints, top_n=max(12, _TOP_K)
         )
         if profit_search is not None:
             candidates = profit_search.rank_candidates(
                 candidates, status, state, constraints, opportunity
             )
-        return candidates[:5]
+        return candidates[:_TOP_K]
 
     return rank
 
@@ -306,6 +391,14 @@ def _clone_loaded_cargo_repository(base_repo: Any) -> Any:
     repo._simulation_start_dt = base_repo._simulation_start_dt
     repo._current_time_minutes = base_repo._current_time_minutes
     return repo
+
+
+def _replace_maskable_outputs_with_base(model_dir: str, base_model_path: str) -> None:
+    """Replace a rejected fine-tuned model with the known base model."""
+    target_dir = Path(model_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("policy_maskable_best.zip", "policy_maskable_final.zip"):
+        shutil.copy2(base_model_path, target_dir / name)
 
 
 def build_envs(
@@ -407,6 +500,111 @@ def train_phase_2(config: dict[str, Any]) -> dict[str, Any]:
     return stats
 
 
+def train_maskable_ppo(config: dict[str, Any], phase: int, base_model_path: str | None = None) -> dict[str, Any]:
+    """MaskablePPO training for the requested phase."""
+    _logger.info("Phase %d: MaskablePPO training", phase)
+    from agent.sb3_maskable_trainer import MaskablePPOTrainer
+
+    if phase == 3:
+        model_dir = resolve_project_path(get_config_value(
+            config, "model_dir", "paths.models_dir", default="demo/agent/models"
+        ))
+        # Resolve base model for fine-tuning
+        if base_model_path is None:
+            base_model_path = get_config_value(
+                config, "base_model", "training.finetune.base_model", default=None,
+            )
+        if base_model_path is not None:
+            base_model_path = str(resolve_project_path(base_model_path))
+            if not Path(base_model_path).exists():
+                _logger.warning("Base model not found: %s, training from scratch", base_model_path)
+                base_model_path = None
+
+        regression_threshold = float(get_config_value(
+            config, "regression_threshold", "training.finetune.regression_threshold", default=0.95,
+        ))
+
+        lr_factor = float(get_config_value(
+            config, "learning_rate_factor", "training.finetune.learning_rate_factor", default=0.5,
+        ))
+
+        results = {}
+        for driver_id in ["D001", "D002", "D003", "D005", "D006", "D007", "D008", "D010"]:
+            cfg = build_maskable_ppo_config(config, phase=3, base_model_path=base_model_path)
+            cfg.learning_rate *= lr_factor
+            cfg.model_dir = f"{model_dir}/{driver_id}/maskable"
+            stats = MaskablePPOTrainer(cfg).train(
+                env_factory=lambda driver_id=driver_id: build_envs(config, driver_ids=[driver_id]),
+                eval_env_factory=lambda driver_id=driver_id: build_envs(config, driver_ids=[driver_id]),
+            )
+
+            # Regression check: compare fine-tuned vs base model
+            if base_model_path and Path(base_model_path).exists():
+                ft_income = stats.get("best_income", 0.0)
+                base_cfg = build_maskable_ppo_config(config, phase=2)
+                base_cfg.model_dir = str(Path(base_model_path).parent)
+                base_envs = build_envs(config, driver_ids=[driver_id])
+                base_trainer = MaskablePPOTrainer(base_cfg)
+                try:
+                    from sb3_contrib import MaskablePPO
+                    base_trainer._model = MaskablePPO.load(base_model_path)
+                    base_income = base_trainer._evaluate(base_envs[0]) if base_envs else 0.0
+                    regression_error = ""
+                except Exception as exc:
+                    base_income = 0.0
+                    regression_error = str(exc)
+
+                stats["base_income"] = base_income
+                if regression_error:
+                    stats["regression_check_error"] = regression_error
+
+                discard_regressed = (
+                    (base_income > 0 and ft_income < base_income * regression_threshold)
+                    or (base_income <= 0 and ft_income <= 0)
+                )
+                if discard_regressed:
+                    _logger.warning(
+                        "Driver %s regression: ft_income=%.0f base_income=%.0f threshold=%.2f, replacing fine-tuned model with base",
+                        driver_id, ft_income, base_income, regression_threshold,
+                    )
+                    _replace_maskable_outputs_with_base(cfg.model_dir, base_model_path)
+                    stats["regression_discarded"] = True
+                    stats["discard_replacement_model"] = base_model_path
+                    stats["best_model_path"] = str(Path(cfg.model_dir) / "policy_maskable_best.zip")
+                    stats["final_model_path"] = str(Path(cfg.model_dir) / "policy_maskable_final.zip")
+                else:
+                    _logger.info(
+                        "Driver %s fine-tune OK: ft_income=%.0f >= base_income=%.0f * %.2f",
+                        driver_id, ft_income, base_income, regression_threshold,
+                    )
+                    stats["regression_discarded"] = False
+
+            write_training_summary(
+                phase=3,
+                stats=stats,
+                config={**config, "driver_id": driver_id, "algo": "maskable_ppo"},
+                ppo_config=cfg,
+            )
+            results[driver_id] = stats
+        return results
+
+    cfg = build_maskable_ppo_config(config, phase=phase, base_model_path=base_model_path)
+    if phase == 1:
+        cfg.eval_interval = min(cfg.eval_interval, 10)
+        cfg.save_interval = min(cfg.save_interval, 25)
+    stats = MaskablePPOTrainer(cfg).train(
+        env_factory=lambda: build_envs(config),
+        eval_env_factory=lambda: build_envs(config),
+    )
+    write_training_summary(
+        phase=phase,
+        stats=stats,
+        config={**config, "algo": "maskable_ppo"},
+        ppo_config=cfg,
+    )
+    return stats
+
+
 def train_phase_3(config: dict[str, Any]) -> dict[str, Any]:
     """Phase 3: per-driver fine-tuning."""
     _logger.info("Phase 3: per-driver fine-tuning")
@@ -452,15 +650,24 @@ def main() -> None:
         default=2,
         help="Training phase: 1=warm-up, 2=PPO, 3=fine-tune",
     )
+    parser.add_argument(
+        "--algo",
+        choices=["ppo", "maskable_ppo"],
+        default="ppo",
+        help="Training algorithm",
+    )
     parser.add_argument("--episodes", type=int, default=None, help="Override episodes")
+    parser.add_argument("--base-model", type=str, default=None, help="Base model path for fine-tuning (.zip)")
     args = parser.parse_args()
 
     config = load_config(args.config)
     if args.episodes is not None:
         config["total_episodes"] = args.episodes
 
-    _logger.info("Starting training phase=%d", args.phase)
-    if args.phase == 1:
+    _logger.info("Starting training phase=%d algo=%s", args.phase, args.algo)
+    if args.algo == "maskable_ppo":
+        stats = train_maskable_ppo(config, phase=args.phase, base_model_path=args.base_model)
+    elif args.phase == 1:
         stats = train_phase_1(config)
     elif args.phase == 2:
         stats = train_phase_2(config)

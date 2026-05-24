@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from agent.rl_env import DriverRLEnv, _ACTION_DIM, _STATE_DIM
+from agent.rl_env import DriverRLEnv, _ACTION_DIM, _STATE_DIM, _WAIT_ACTION_DURATIONS
 
 _logger = logging.getLogger("agent.rl_trainer")
 
@@ -322,7 +322,7 @@ class PPOTrainer:
         if mask.shape != (_ACTION_DIM,):
             mask = np.ones(_ACTION_DIM, dtype=np.bool_)
         if not mask.any():
-            mask[0:2] = True
+            mask[list(_WAIT_ACTION_DURATIONS)] = True
         return mask
 
     @staticmethod

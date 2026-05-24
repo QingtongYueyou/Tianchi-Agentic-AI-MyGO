@@ -70,9 +70,9 @@ class RLDecisionLayer:
             return candidates
 
         try:
-            from agent.rl_env import encode_state
+            from agent.rl_env import ACTION_CARGO_0, _TOP_K, encode_state
 
-            policy_candidates = [self._candidate_as_env_item(c) for c in candidates[:5]]
+            policy_candidates = [self._candidate_as_env_item(c) for c in candidates[:_TOP_K]]
             state_vec = encode_state(status, state_tracker, policy_candidates, constraints)
             state_feat = state_vec[:20]
             policy_probs, policy_value = self._policy.forward(state_vec)
@@ -98,10 +98,10 @@ class RLDecisionLayer:
                     )
                     pos_value = float(self._value.forward(pos_feat))
 
-                action_idx = 2 + idx
+                action_idx = ACTION_CARGO_0 + idx
                 policy_prob = (
                     float(policy_probs[action_idx])
-                    if idx < 5 and action_idx < len(policy_probs)
+                    if idx < _TOP_K and action_idx < len(policy_probs)
                     else 0.0
                 )
                 rl_score = (
@@ -157,16 +157,22 @@ class RLDecisionLayer:
             return None
 
         try:
-            from agent.rl_env import encode_state
+            from agent.rl_env import ACTION_CARGO_0, _TOP_K, _WAIT_ACTION_DURATIONS, encode_state
 
-            policy_candidates = [self._candidate_as_env_item(c) for c in candidates[:5]]
+            policy_candidates = [self._candidate_as_env_item(c) for c in candidates[:_TOP_K]]
             state_vec = encode_state(status, state_tracker, policy_candidates, constraints)
             policy_probs, policy_value = self._policy.forward(state_vec)
-            wait_idx = 0 if policy_probs[0] >= policy_probs[1] else 1
+            wait_indices = [
+                idx for idx in _WAIT_ACTION_DURATIONS
+                if idx < len(policy_probs)
+            ]
+            if not wait_indices:
+                return None
+            wait_idx = max(wait_indices, key=lambda idx: float(policy_probs[idx]))
             wait_prob = float(policy_probs[wait_idx])
-            cargo_count = min(5, len(candidates))
+            cargo_count = min(_TOP_K, len(candidates))
             best_cargo_prob = (
-                float(np.max(policy_probs[2:2 + cargo_count]))
+                float(np.max(policy_probs[ACTION_CARGO_0:ACTION_CARGO_0 + cargo_count]))
                 if cargo_count > 0 else 0.0
             )
             if (
@@ -175,7 +181,7 @@ class RLDecisionLayer:
             ):
                 return {
                     "action": "wait",
-                    "params": {"duration_minutes": 30 if wait_idx == 0 else 60},
+                    "params": {"duration_minutes": _WAIT_ACTION_DURATIONS[wait_idx]},
                     "rl_wait_prob": wait_prob,
                     "rl_best_cargo_prob": best_cargo_prob,
                     "rl_policy_value": float(policy_value),

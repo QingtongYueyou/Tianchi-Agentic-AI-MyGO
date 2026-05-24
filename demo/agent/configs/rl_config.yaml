@@ -3,9 +3,9 @@
 
 # ===== 环境配置 =====
 env:
-  state_dim: 49              # 状态向量维度
-  action_dim: 9              # 动作空间大小
-  max_cargo_candidates: 5    # 最大候选货源数
+  state_dim: 79              # 状态向量维度
+  action_dim: 18             # 动作空间大小
+  max_cargo_candidates: 10   # 最大候选货源数
   reposition_speed_kmh: 60.0 # 空驶速度 km/h
   simulation_days: 31        # 月度天数
   simulation_minutes: 44640  # 31天总分钟数
@@ -23,6 +23,13 @@ ppo:
   n_epochs: 10               # 每次更新的epoch数
   n_steps: 2048              # 每次收集的步数
 
+maskable_ppo:
+  teacher_pretrain_steps: 512
+  teacher_pretrain_epochs: 2
+  teacher_batch_size: 128
+  teacher_learning_rate: 1.0e-4
+  teacher_min_cargo_score: 0.0
+
 # ===== 训练配置 =====
 training:
   # Phase 1: 行为克隆预训练
@@ -37,6 +44,10 @@ training:
   # Phase 3: 针对性微调
   finetune_episodes: 200     # 微调episodes数
   finetune_lr: 1.0e-4        # 微调学习率（更小）
+  finetune:
+    base_model: "demo/agent/models/policy_maskable_best.zip"
+    learning_rate_factor: 0.5
+    regression_threshold: 0.95
   
   # 课程学习
   curriculum:
