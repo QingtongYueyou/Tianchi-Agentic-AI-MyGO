@@ -18,5 +18,9 @@ __pycache__/
 demo/results/actions_*.jsonl
 demo/results/logs/
 demo/results/history/
+demo/results/rl_logs/
 demo/results/monthly_income_*.json
 demo/results/run_summary_*.json
+demo/agent/models/policy_ep*.npz
+!demo/agent/models/policy_best.npz
+!demo/agent/models/policy_final.npz

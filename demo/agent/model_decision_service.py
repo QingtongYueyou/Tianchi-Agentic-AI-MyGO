@@ -35,8 +35,8 @@ _MAX_SOFT_PENALTY_PER_MONTH = 1000
 _LONG_ORDER_THRESHOLD_MINUTES = 360      # 6 小时
 _HEAVY_DEADHEAD_KM = 90
 _EXTREME_DEADHEAD_KM = 150
-_DEADHEAD_REJECT_TRUE_NET = 800          # 极端空驶需 true_net 达标才允许
-_LONG_ORDER_REJECT_TRUE_NET = 500        # >10h 长单需 true_net 达标才允许
+_DEADHEAD_REJECT_TRUE_NET = 200          # 极端空驶只保留亏损保护，正收益优先跑
+_LONG_ORDER_REJECT_TRUE_NET = 80         # >10h 长单只拒绝薄利单，避免把可赚订单等没
 
 _logger = logging.getLogger("agent.hybrid_decision")
 
@@ -1547,11 +1547,19 @@ class ProfitSearchLayer:
         if not candidates:
             return None
 
-        safe = [c for c in candidates if not c.get("has_soft_penalty", False)]
-        penalty = [c for c in candidates if c.get("has_soft_penalty", False)]
+        safe = sorted(
+            (c for c in candidates if not c.get("has_soft_penalty", False)),
+            key=self._candidate_value,
+            reverse=True,
+        )
+        penalty = sorted(
+            (c for c in candidates if c.get("has_soft_penalty", False)),
+            key=self._candidate_value,
+            reverse=True,
+        )
 
-        best_safe = max(safe, key=self._candidate_value) if safe else None
-        best_penalty = max(penalty, key=self._candidate_value) if penalty else None
+        best_safe = self._first_passing_guard(safe)
+        best_penalty = self._first_passing_guard(penalty)
 
         chosen = None
         if best_penalty and best_safe:
@@ -1566,11 +1574,6 @@ class ProfitSearchLayer:
         if chosen is None:
             return None
 
-        value = self._candidate_value(chosen)
-        if chosen["total_minutes"] > 600 and value < _LONG_ORDER_REJECT_TRUE_NET:
-            return None
-        if chosen["deadhead_km"] > _EXTREME_DEADHEAD_KM and value < _DEADHEAD_REJECT_TRUE_NET:
-            return None
         return chosen
 
     @staticmethod
@@ -1579,6 +1582,30 @@ class ProfitSearchLayer:
             "profit_search_score",
             candidate.get("true_net", candidate.get("score", 0.0)),
         ) or 0.0)
+
+    @classmethod
+    def _guard_value(cls, candidate: dict) -> float:
+        true_net = float(candidate.get(
+            "true_net", candidate.get("score", 0.0)) or 0.0)
+        return max(cls._candidate_value(candidate), true_net)
+
+    @classmethod
+    def _passes_guard(cls, candidate: dict) -> bool:
+        value = cls._guard_value(candidate)
+        total_minutes = int(candidate.get("total_minutes", 0) or 0)
+        deadhead_km = float(candidate.get("deadhead_km", 0.0) or 0.0)
+        if total_minutes > 600 and value < _LONG_ORDER_REJECT_TRUE_NET:
+            return False
+        if deadhead_km > _EXTREME_DEADHEAD_KM and value < _DEADHEAD_REJECT_TRUE_NET:
+            return False
+        return True
+
+    @classmethod
+    def _first_passing_guard(cls, candidates: list[dict]) -> dict | None:
+        for candidate in candidates:
+            if cls._passes_guard(candidate):
+                return candidate
+        return None
 
     def _downstream_value(
         self,
@@ -1664,7 +1691,9 @@ class ProfitSearchLayer:
         next_day_ten = (current_day + 1) * 1440 + 10 * 60
         if finish_min <= next_day_ten:
             return 0.0
-        return min(12000.0, 6000.0 + (total_minutes - 600) * 3.0)
+        overrun_after_ten = max(0, finish_min - next_day_ten)
+        long_extra = max(0, total_minutes - 600)
+        return min(900.0, 180.0 + overrun_after_ten * 0.25 + long_extra * 0.15)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3415,7 +3444,7 @@ class MultiDriverCoordinationLayer:
 class ModelDecisionService:
     """三层混合决策架构主入口。"""
 
-    def __init__(self, api: SimulationApiPort) -> None:
+    def __init__(self, api: SimulationApiPort, enable_rl_layer: bool = True) -> None:
         self._api = api
         self._logger = logging.getLogger("agent.decision_service")
         # 各层组件
@@ -3438,6 +3467,8 @@ class ModelDecisionService:
         self.token_optimizer = TokenBudgetOptimizer()
         # Task #7: 多司机信息共享与协调层
         self.coordination_layer = MultiDriverCoordinationLayer()
+        # RL 增强层（可选加载）
+        self._rl_layer = self._try_load_rl_layer() if enable_rl_layer else None
         # 已注册到 token_optimizer / coordination_layer 的 driver 集合
         self._registered_drivers: set[str] = set()
         # Task #4: 战略规划器 + 决策审核员
@@ -3448,6 +3479,28 @@ class ModelDecisionService:
         if driver_id not in self._state_tracker:
             self._state_tracker[driver_id] = StateTracker()
         return self._state_tracker[driver_id]
+
+    @staticmethod
+    def _try_load_rl_layer() -> Any:
+        """尝试加载 RL 增强层（可选，模型文件不存在时返回 None）。"""
+        try:
+            from agent.rl_integration import RLDecisionLayer
+            from pathlib import Path
+            model_dir = Path(__file__).parent / "models"
+            policy = model_dir / "policy_best.npz"
+            value = model_dir / "value_best.npz"
+            scorer = model_dir / "scorer_best.npz"
+            if policy.exists():
+                layer = RLDecisionLayer(
+                    policy_path=policy,
+                    value_path=value if value.exists() else None,
+                    scorer_path=scorer if scorer.exists() else None,
+                )
+                if layer.is_loaded:
+                    return layer
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _task_key(task: dict) -> tuple:
@@ -3631,11 +3684,19 @@ class ModelDecisionService:
         if not candidates:
             return None
 
-        safe = [c for c in candidates if not c.get("has_soft_penalty", False)]
-        penalty = [c for c in candidates if c.get("has_soft_penalty", False)]
+        safe = sorted(
+            (c for c in candidates if not c.get("has_soft_penalty", False)),
+            key=lambda c: c.get("true_net", c["score"]),
+            reverse=True,
+        )
+        penalty = sorted(
+            (c for c in candidates if c.get("has_soft_penalty", False)),
+            key=lambda c: c.get("true_net", c["score"]),
+            reverse=True,
+        )
 
-        best_safe = max(safe, key=lambda c: c.get("true_net", c["score"])) if safe else None
-        best_penalty = max(penalty, key=lambda c: c.get("true_net", c["score"])) if penalty else None
+        best_safe = next((c for c in safe if ProfitSearchLayer._passes_guard(c)), None)
+        best_penalty = next((c for c in penalty if ProfitSearchLayer._passes_guard(c)), None)
 
         chosen = None
         if best_penalty and best_safe:
@@ -3646,16 +3707,6 @@ class ModelDecisionService:
             chosen = best_safe
         elif best_penalty:
             chosen = best_penalty
-
-        if chosen is None:
-            return None
-
-        # 极端情况拒绝：>10h 或 >150km 空驶，除非 true_net 足够高
-        tn = chosen.get("true_net", chosen["score"])
-        if chosen["total_minutes"] > 600 and tn < _LONG_ORDER_REJECT_TRUE_NET:
-            return None
-        if chosen["deadhead_km"] > _EXTREME_DEADHEAD_KM and tn < _DEADHEAD_REJECT_TRUE_NET:
-            return None
 
         return chosen
 
@@ -4360,7 +4411,7 @@ class ModelDecisionService:
 
         # 8. 启发式评分
         candidates = self._heuristic_layer.score_and_rank(
-            items, status_after_query, state, constraints, top_n=5)
+            items, status_after_query, state, constraints, top_n=12)
 
         if not candidates:
             decision = {"action": "wait", "params": {"duration_minutes": 30}}
@@ -4372,6 +4423,12 @@ class ModelDecisionService:
             candidates, status_after_query, state, constraints,
             self.opportunity_predictor,
         )
+
+        # RL 增强重排（可选）
+        if self._rl_layer is not None and self._rl_layer.should_use_rl(driver_id, state, candidates):
+            candidates = self._rl_layer.rank_candidates(
+                candidates, status_after_query, state, constraints,
+            )
         _decision_complexity = "low"
         if len(candidates) > 3:
             _decision_complexity = "medium"
@@ -4386,8 +4443,44 @@ class ModelDecisionService:
         # 同步 StateTracker 的 token 用量到 token_optimizer
         self.token_optimizer.usage_tracker[driver_id] = state.total_tokens_used
 
+        if self._rl_layer is not None:
+            _rl_wait = self._rl_layer.select_wait_action(
+                candidates, status_after_query, state, constraints
+            )
+            if _rl_wait is not None:
+                decision = {
+                    "action": "wait",
+                    "params": _rl_wait.get("params", {"duration_minutes": 30}),
+                }
+                self._logger.info(
+                    "RL direct wait driver=%s wait_prob=%.3f cargo_prob=%.3f",
+                    driver_id,
+                    float(_rl_wait.get("rl_wait_prob", 0.0)),
+                    float(_rl_wait.get("rl_best_cargo_prob", 0.0)),
+                )
+                decision = self._maybe_review_decision(
+                    decision, candidates, state, status_after_query,
+                    constraints, current_min, driver_id,
+                    _decision_complexity, _remaining_steps, items,
+                )
+                self._update_state_after_decision(state, decision, current_min, candidates)
+                self.coordination_layer.record_decision(
+                    driver_id,
+                    "",
+                    decision.get("action", ""),
+                )
+                return decision
+
         # 9. 快速接单路径：基于短视野利润搜索的安全/吃罚候选分离
-        _chosen = self.profit_search_layer.select_best(candidates)
+        # 优先使用 RL 选择（如果可用）
+        if self._rl_layer is not None:
+            _rl_chosen = self._rl_layer.select_best(candidates)
+            if _rl_chosen is not None:
+                _chosen = _rl_chosen
+            else:
+                _chosen = self.profit_search_layer.select_best(candidates)
+        else:
+            _chosen = self.profit_search_layer.select_best(candidates)
         best_true_net = self._best_true_net(candidates)
         best_profit_score = (
             ProfitSearchLayer._candidate_value(_chosen)

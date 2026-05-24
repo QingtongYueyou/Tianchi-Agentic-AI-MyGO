@@ -116,6 +116,64 @@ class EmbeddedDecisionEnvironment:
             "records": out,
         }
 
+    def wait(self, driver_id: str, duration_minutes: int) -> dict[str, Any]:
+        return simulation_actions.wait(
+            self._repo,
+            self._manager,
+            driver_id,
+            duration_minutes,
+        )
+
+    def take_order(self, driver_id: str, cargo_id: str) -> dict[str, Any]:
+        cargo_id = str(cargo_id)
+        cargo = self._repo.get_by_id(cargo_id)
+        try:
+            result = simulation_actions.take_order(
+                self._repo,
+                self._manager,
+                driver_id,
+                cargo_id,
+                reposition_speed_km_per_hour=60.0,
+                simulation_horizon_minutes=self._simulation_horizon_minutes,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if (
+                (cargo is None and "cargo_id" in message)
+                or "load_time" in message
+                or "cost_time_minutes" in message
+            ):
+                return {
+                    "accepted": False,
+                    "detail": "cargo_unavailable_or_invalid",
+                    "driver_id": driver_id,
+                    "cargo_id": cargo_id,
+                    "simulation_progress_minutes": self._manager.get_simulation_progress_minutes(),
+                    "simulation_wall_time": self._manager.get_simulation_wall_time(),
+                    "pickup_deadhead_km": 0,
+                    "haul_distance_km": 0,
+                    "revenue": 0,
+                }
+            raise
+        if cargo is not None and "price" in cargo:
+            listed_revenue = round(float(cargo["price"]) / 100.0, 2)
+            result["listed_revenue"] = listed_revenue
+            if result.get("accepted") and result.get("income_eligible", True):
+                result["revenue"] = listed_revenue
+            else:
+                result["revenue"] = 0.0
+        return result
+
+    def reposition(self, driver_id: str, lat: float, lng: float) -> dict[str, Any]:
+        return simulation_actions.reposition(
+            self._repo,
+            self._manager,
+            driver_id,
+            lat,
+            lng,
+            speed_km_per_hour=60.0,
+        )
+
     def model_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         resp = self._model_gateway.chat_completion(payload)
         resp.raise_for_status()

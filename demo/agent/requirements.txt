@@ -1,1 +1,9 @@
 # 决策核心仅依赖 Python 标准库；评测依赖见 demo/server/requirements.txt
+
+# RL 训练依赖（本地训练用，竞赛推理不需要 torch 以外的包）
+torch>=2.0.0
+numpy>=1.24.0
+gymnasium>=0.28.0
+stable-baselines3>=2.0.0
+tensorboard>=2.12.0
+pyyaml>=6.0

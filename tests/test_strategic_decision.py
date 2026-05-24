@@ -993,8 +993,56 @@ class TestProfitSearchLayer:
 
         ranked = layer.rank_candidates(candidates, status, state, [], None)
 
-        assert ranked[0]["overnight_risk_cost"] >= 6000
-        assert ranked[0]["profit_search_score"] < 0
+        assert 0 < ranked[0]["overnight_risk_cost"] <= 900
+        assert ranked[0]["profit_search_score"] > 0
+
+    def test_positive_long_order_is_not_waited_away(self):
+        layer = ProfitSearchLayer()
+        candidates = [{
+            "cargo_id": "LONG_BUT_PROFITABLE",
+            "true_net": 220.0,
+            "score": 220.0,
+            "net_profit": 820.0,
+            "total_minutes": 780,
+            "deadhead_km": 12.0,
+            "has_soft_penalty": False,
+            "end": {"lat": 23.0, "lng": 113.0},
+        }]
+
+        best = layer.select_best(candidates)
+
+        assert best is not None
+        assert best["cargo_id"] == "LONG_BUT_PROFITABLE"
+
+    def test_select_best_falls_back_when_top_fails_guard(self):
+        layer = ProfitSearchLayer()
+        candidates = [
+            {
+                "cargo_id": "TOO_THIN_FAR",
+                "true_net": 50.0,
+                "score": 50.0,
+                "net_profit": 500.0,
+                "total_minutes": 60,
+                "deadhead_km": 220.0,
+                "has_soft_penalty": False,
+                "end": {"lat": 23.0, "lng": 113.0},
+            },
+            {
+                "cargo_id": "RUNNABLE",
+                "true_net": 160.0,
+                "score": 160.0,
+                "net_profit": 360.0,
+                "total_minutes": 180,
+                "deadhead_km": 15.0,
+                "has_soft_penalty": False,
+                "end": {"lat": 23.0, "lng": 113.0},
+            },
+        ]
+
+        best = layer.select_best(candidates)
+
+        assert best is not None
+        assert best["cargo_id"] == "RUNNABLE"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1200,9 +1248,9 @@ class TestSelectBestByTrueNet:
         best = ModelDecisionService._select_best_by_true_net(candidates)
         assert best["cargo_id"] == "PENALTY"
 
-    def test_extreme_deadhead_rejected(self):
+    def test_extreme_deadhead_rejected_when_profit_is_too_thin(self):
         candidates = [
-            {"cargo_id": "FAR", "score": 500, "true_net": 500,
+            {"cargo_id": "FAR", "score": 120, "true_net": 120,
              "has_soft_penalty": False, "hard_penalty": 0,
              "total_minutes": 60, "deadhead_km": 200},
         ]
@@ -1212,7 +1260,7 @@ class TestSelectBestByTrueNet:
 
     def test_extreme_deadhead_accepted_with_high_true_net(self):
         candidates = [
-            {"cargo_id": "FAR_BUT_RICH", "score": 900, "true_net": 900,
+            {"cargo_id": "FAR_BUT_RICH", "score": 500, "true_net": 500,
              "has_soft_penalty": False, "hard_penalty": 0,
              "total_minutes": 60, "deadhead_km": 200},
         ]
